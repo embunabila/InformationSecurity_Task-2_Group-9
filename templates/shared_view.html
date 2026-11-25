@@ -1,0 +1,141 @@
+
+{% extends "app_base.html" %}
+
+{% block title %}Shared with me — Medimo{% endblock %}
+
+{% block content %}
+<header class="top">
+    <div>
+        <span class="eyebrow">DATA SHARING</span>
+        <h1>Shared with me</h1>
+        <p class="muted">
+            Access health records that other users have shared with you.
+        </p>
+    </div>
+</header>
+
+<section class="card panel">
+    <span class="eyebrow">SHARED RECORDS</span>
+    <h2>Your shared items</h2>
+
+    <p class="muted">
+        Enter the key package provided by the data owner and your
+        account password to access a shared item.
+    </p>
+
+    {% if not shared_requests %}
+        <div class="notice">
+            You don't have any shared records yet.
+        </div>
+    {% else %}
+        {% for share_request in shared_requests %}
+            <div class="archive-item">
+                <h3>{{ share_request["owner_username"] }}</h3>
+
+                <small>
+                    Category: {{ share_request["category"]|title }}
+                </small>
+
+                <small>
+                    Shared since: {{ share_request["created_at"] }}
+                </small>
+
+                <small>
+                    Expires at: {{ share_request["expires_at"] }}
+                </small>
+
+                {% for item in share_request["items"] %}
+                    <div class="archive-controls">
+                        <strong>
+                            {% if item["category"] == "profile" %}
+                                Health Profile
+                            {% elif item["category"] == "identity" %}
+                                Identity Document
+                            {% elif item["category"] == "document" %}
+                                Medical Document
+                            {% elif item["category"] == "video" %}
+                                Medical Video
+                            {% else %}
+                                {{ item["category"]|title }}
+                            {% endif %}
+                        </strong>
+
+                        <small>
+                            Added: {{ item["created_at"] }}
+                        </small>
+
+                        <form
+                            method="post"
+                            action="{{ url_for(
+                                'access.open_shared',
+                                request_id=share_request['id'],
+                                item_id=item['id']
+                            ) }}"
+                            class="stack"
+                        >
+                            <input
+                                type="hidden"
+                                name="csrf_token"
+                                value="{{ csrf_token }}"
+                            >
+
+                            <label for="package-{{ item['id'] }}">
+                                Key package
+                            </label>
+
+                            <textarea
+                                id="package-{{ item['id'] }}"
+                                name="package"
+                                rows="4"
+                                required
+                                placeholder="Paste your key package here"
+                            ></textarea>
+
+                            <label for="password-{{ item['id'] }}">
+                                Your account password
+                            </label>
+
+                            <input
+                                id="password-{{ item['id'] }}"
+                                type="password"
+                                name="password"
+                                required
+                                autocomplete="current-password"
+                            >
+
+                            {% if item["category"] == "profile" %}
+                                <button
+                                    class="button primary"
+                                    type="submit"
+                                    name="mode"
+                                    value="view"
+                                >
+                                    View profile
+                                </button>
+                            {% else %}
+                                <button
+                                    class="button primary"
+                                    type="submit"
+                                    name="mode"
+                                    value="view"
+                                >
+                                    View file
+                                </button>
+
+                                <button
+                                    class="button secondary"
+                                    type="submit"
+                                    name="mode"
+                                    value="download"
+                                >
+                                    Download file
+                                </button>
+                            {% endif %}
+                        </form>
+                    </div>
+                {% endfor %}
+            </div>
+        {% endfor %}
+    {% endif %}
+</section>
+{% endblock %}

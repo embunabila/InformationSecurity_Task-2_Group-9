@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -487,6 +488,210 @@ class KeyPackageTests(unittest.TestCase):
                 with self.assertRaises(self.error):
                     self.share_keys.parse_key_package(_raw_package(fields))
                     
+
+APPROVED_REQUEST_ID = "5d0c6a43-8e1f-4b7a-a2c9-3e4f5a6b7c8d"
+REQUESTER_KEY_PEM = "-----BEGIN PUBLIC KEY-----\nrequester\n-----END PUBLIC KEY-----\n"
+
+
+def _fake_fingerprint(public_key_pem):
+    digest = hashlib.sha256(public_key_pem.encode("ascii")).hexdigest().upper()
+    return " ".join(digest[i:i + 4] for i in range(0, 64, 4))
+
+
+class GrantRoutesTests(unittest.TestCase):
+    def setUp(self):
+        env_patcher = patch.dict(
+            os.environ,
+            {
+                "SECRET_KEY": "dummy-secret-key-for-testing",
+                "MASTER_KEY": "11" * 32,
+            },
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+        self.calls = []
+        self.requests = {
+            APPROVED_REQUEST_ID: {
+                "id": APPROVED_REQUEST_ID,
+                "requester_id": OTHER_ID,
+                "owner_id": OWNER_ID,
+                "category": "document",
+                "status": "approved",
+                "wrapped_key": WRAPPED_KEY,
+                "expires_at": "2026-12-02 08:00:00",
+            }
+        }
+        self.public_keys = {
+            OTHER_ID: {
+                "public_key_pem": REQUESTER_KEY_PEM,
+                "fingerprint": _fake_fingerprint(REQUESTER_KEY_PEM),
+            }
+        }
+
+        share_errors = importlib.import_module("share_errors")
+
+        def get_request_for_owner(owner_id, request_id):
+            self.calls.append("get_request_for_owner")
+            row = self.requests.get(request_id)
+            if row is None or row["owner_id"] != owner_id:
+                raise share_errors.ShareAccessError("no access")
+            return row
+
+        def expire_old_requests():
+            self.calls.append("expire_old_requests")
+            return 0
+
+        fake_modules = {
+            "share_requests": types.ModuleType("share_requests"),
+            "share_access": types.ModuleType("share_access"),
+            "user_keys": types.ModuleType("user_keys"),
+        }
+        fake_modules["share_requests"].get_request_for_owner = get_request_for_owner
+        fake_modules["share_access"].expire_old_requests = expire_old_requests
+        fake_modules["user_keys"].get_public_key = self.public_keys.get
+        fake_modules["user_keys"].public_key_fingerprint = _fake_fingerprint
+        fake_modules["user_keys"].wrap_key = None
+
+        # Always mock the other members' modules, even once they exist.
+        modules_patcher = patch.dict(sys.modules, fake_modules)
+        modules_patcher.start()
+        self.addCleanup(modules_patcher.stop)
+        sys.modules.pop("share_keys", None)
+
+        self.app_module = importlib.import_module("app")
+        self.db = importlib.import_module("db")
+        self.share_keys = importlib.import_module("share_keys")
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        db_patcher = patch.object(self.db, "DB_PATH", Path(temp_dir.name) / "test.db")
+        db_patcher.start()
+        self.addCleanup(db_patcher.stop)
+
+        self.db.init_db()
+        connection = self.db.get_connection()
+        try:
+            connection.executemany(
+                "INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)",
+                [(OWNER_ID, "owner", "x"), (OTHER_ID, "dummy_requester", "x")],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        config_patcher = patch.dict(self.app_module.app.config, {"TESTING": True})
+        config_patcher.start()
+        self.addCleanup(config_patcher.stop)
+
+        self.client = self.app_module.app.test_client()
+
+    def _login(self, user_id):
+        with self.client.session_transaction() as session:
+            session["user_id"] = user_id
+
+    def _expected_package(self):
+        return self.share_keys.build_key_package(
+            APPROVED_REQUEST_ID, WRAPPED_KEY, _fake_fingerprint(REQUESTER_KEY_PEM)
+        )
+
+    def _urls(self, request_id=APPROVED_REQUEST_ID):
+        return (
+            f"/requests/{request_id}/package",
+            f"/requests/{request_id}/package/download",
+        )
+
+    def _assert_unavailable(self, status=404):
+        for url in self._urls():
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, status)
+                self.assertNotIn(self._expected_package(), response.get_data(as_text=True))
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_requires_login(self):
+        for url in self._urls():
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 302)
+                self.assertTrue(response.headers["Location"].endswith("/login"))
+        self.assertEqual(self.calls, [])
+
+    def test_owner_sees_package_and_fingerprint(self):
+        self._login(OWNER_ID)
+        response = self.client.get(self._urls()[0])
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(self._expected_package(), html)
+        self.assertIn(_fake_fingerprint(REQUESTER_KEY_PEM), html)
+        self.assertIn("dummy_requester", html)
+        self.assertIn(self._urls()[1], html)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(self.calls, ["expire_old_requests", "get_request_for_owner"])
+
+    def test_shown_package_parses_back_to_stored_wrapped_key(self):
+        self._login(OWNER_ID)
+        self.client.get(self._urls()[0])
+        parsed = self.share_keys.parse_key_package(self._expected_package())
+
+        self.assertEqual(parsed["wrapped_key"], WRAPPED_KEY)
+        self.assertEqual(parsed["request_id"], APPROVED_REQUEST_ID)
+
+    def test_owner_downloads_package_file(self):
+        self._login(OWNER_ID)
+        response = self.client.get(self._urls()[1])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, (self._expected_package() + "\n").encode("ascii"))
+        self.assertEqual(response.mimetype, "application/octet-stream")
+        self.assertIn(
+            f"paket-{APPROVED_REQUEST_ID}.medimokey",
+            response.headers["Content-Disposition"],
+        )
+        self.assertIn("attachment", response.headers["Content-Disposition"])
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+
+    def test_other_users_get_no_package(self):
+        self._login(OTHER_ID)
+        self._assert_unavailable()
+
+    def test_unknown_or_malformed_request_id(self):
+        self._login(OWNER_ID)
+        for request_id in (str(uuid.uuid4()), APPROVED_REQUEST_ID.upper(), "abc"):
+            for url in self._urls(request_id):
+                with self.subTest(url=url):
+                    self.assertEqual(self.client.get(url).status_code, 404)
+
+    def test_request_that_is_not_approved_has_no_package(self):
+        self._login(OWNER_ID)
+        row = self.requests[APPROVED_REQUEST_ID]
+
+        for status in ("pending", "rejected", "revoked", "expired"):
+            with self.subTest(status=status):
+                row["status"] = status
+                self._assert_unavailable()
+
+        row["status"] = "approved"
+        row["wrapped_key"] = None
+        self._assert_unavailable()
+
+    def test_requester_without_key_pair(self):
+        self._login(OWNER_ID)
+        del self.public_keys[OTHER_ID]
+        self._assert_unavailable()
+
+    def test_mismatched_stored_fingerprint_is_refused(self):
+        self._login(OWNER_ID)
+        self.public_keys[OTHER_ID]["fingerprint"] = FINGERPRINT
+        self._assert_unavailable(status=503)
+
+    def test_broken_wrapped_key_is_refused(self):
+        self._login(OWNER_ID)
+        self.requests[APPROVED_REQUEST_ID]["wrapped_key"] = b"short"
+        self._assert_unavailable(status=503)
+        
 
 if __name__ == "__main__":
     unittest.main()

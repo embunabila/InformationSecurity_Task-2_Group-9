@@ -1,0 +1,166 @@
+{% extends "app_base.html" %}
+{% block title %}Access requests — Medimo{% endblock %}
+
+{% set category_labels = {
+    "profile": "Health profile",
+    "identity": "Identity (KTP / BPJS)",
+    "document": "Health document",
+    "video": "Video",
+} %}
+{% set status_labels = {
+    "pending": "Waiting",
+    "approved": "Approved",
+    "rejected": "Rejected",
+    "revoked": "Revoked",
+    "expired": "Expired",
+} %}
+
+{% block content %}
+<header class="top">
+    <div>
+        <span class="eyebrow">DATA SHARING</span>
+        <h1>Access requests</h1>
+        <p class="muted">Ask other users for their data, and decide who can see yours.</p>
+    </div>
+    <a class="button secondary" href="{{ url_for('dashboard') }}">← Dashboard</a>
+</header>
+
+{% if notice %}
+    <div class="alert success" role="status"><p>{{ notice }}</p></div>
+{% endif %}
+{% if error %}
+    <div class="alert error" role="alert"><p>{{ error }}</p></div>
+{% endif %}
+
+<section class="archive-grid" style="margin-top:0">
+    <div class="card panel">
+        <span class="eyebrow">NEW REQUEST</span>
+        <h2>Ask for access</h2>
+
+        {% if has_keypair %}
+            <p class="muted">The owner chooses exactly which items to share and for how long.</p>
+            <form class="stack" method="post" action="/requests" autocomplete="off">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+                <label for="owner_username">Owner's username</label>
+                <input id="owner_username" name="owner_username" maxlength="30" required>
+
+                <label for="category">Category</label>
+                <select id="category" name="category" required>
+                    <option value="">Select a category</option>
+                    {% for value, label in category_labels.items() %}
+                        <option value="{{ value }}">{{ label }}</option>
+                    {% endfor %}
+                </select>
+
+                <label for="reason">Reason</label>
+                <textarea id="reason" name="reason" maxlength="500" rows="3" required
+                          style="width:100%;border:1px solid #d8e5ef;border-radius:10px;background:#fbfdff;padding:12px;resize:vertical"></textarea>
+                <small>Maximum 500 characters.</small>
+
+                <button class="button primary" type="submit">Send request <span>→</span></button>
+            </form>
+        {% else %}
+            <p class="notice">You need a key pair before you can request data. Create one on the <a href="/keys">My keys</a> page first.</p>
+        {% endif %}
+    </div>
+
+    <div class="card panel">
+        <span class="eyebrow">SENT BY YOU</span>
+        <h2>Your requests</h2>
+
+        {% if outgoing %}
+            {% for req in outgoing %}
+                <div style="border-top:1px solid #edf2f6;padding:12px 0">
+                    <strong>{{ req.owner_username }}</strong>
+                    <span class="muted">· {{ category_labels.get(req.category, req.category) }}</span><br>
+                    <small class="muted">
+                        {{ status_labels.get(req.status, req.status) }}
+                        {% if req.status == "approved" and req.expires_at %} · until {{ req.expires_at }}{% endif %}
+                    </small>
+                    {% if req.status == "approved" %}
+                        <p style="margin:8px 0 0"><a href="/shared">Open shared data →</a></p>
+                    {% endif %}
+                </div>
+            {% endfor %}
+        {% else %}
+            <p class="notice">You have not sent any requests yet.</p>
+        {% endif %}
+    </div>
+</section>
+
+<section class="card panel" style="margin-top:16px">
+    <span class="eyebrow">SENT TO YOU</span>
+    <h2>Requests for your data</h2>
+
+    {% if incoming %}
+        {% for req in incoming %}
+            <div style="border-top:1px solid #edf2f6;padding:16px 0">
+                <strong>{{ req.requester_username }}</strong>
+                <span class="muted">wants your {{ category_labels.get(req.category, req.category)|lower }}</span><br>
+                <small class="muted">
+                    {{ status_labels.get(req.status, req.status) }} · requested {{ req.created_at }}
+                    {% if req.status == "approved" and req.expires_at %} · until {{ req.expires_at }}{% endif %}
+                </small>
+                <p class="notice" style="margin:8px 0">Reason: {{ req.reason }}</p>
+
+                {% if req.status == "pending" %}
+                    <form class="stack" method="post" action="/requests/{{ req.id }}/approve">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+                        {% if req.category == "profile" %}
+                            <label>Fields to share</label>
+                            {% for value, label in profile_fields %}
+                                <span>
+                                    <input type="checkbox" id="f-{{ req.id }}-{{ value }}" name="profile_fields" value="{{ value }}" style="width:auto">
+                                    <label for="f-{{ req.id }}-{{ value }}" style="display:inline;font-weight:400">{{ label }}</label>
+                                </span>
+                            {% endfor %}
+                        {% else %}
+                            {% set files = owner_files.get(req.category, []) %}
+                            <label>Files to share</label>
+                            {% if files %}
+                                {% for file in files %}
+                                    <span>
+                                        <input type="checkbox" id="file-{{ req.id }}-{{ file.id }}" name="file_ids" value="{{ file.id }}" style="width:auto">
+                                        <label for="file-{{ req.id }}-{{ file.id }}" style="display:inline;font-weight:400">
+                                            Uploaded {{ file.created_at }} · ID {{ file.id[:8] }}
+                                        </label>
+                                    </span>
+                                {% endfor %}
+                            {% else %}
+                                <p class="notice">You have no files in this category yet.</p>
+                            {% endif %}
+                        {% endif %}
+
+                        <label for="days-{{ req.id }}">Access lasts</label>
+                        <select id="days-{{ req.id }}" name="days" required>
+                            <option value="1">1 day</option>
+                            <option value="7" selected>7 days</option>
+                            <option value="30">30 days</option>
+                        </select>
+
+                        <button class="button primary" type="submit" style="justify-self:start">Approve and share</button>
+                    </form>
+
+                    <form method="post" action="/requests/{{ req.id }}/reject" style="margin-top:8px">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button class="button secondary" type="submit">Reject</button>
+                    </form>
+
+                {% elif req.status == "approved" %}
+                    <p style="display:flex;gap:8px;flex-wrap:wrap;margin:0">
+                        <a class="button primary" href="/requests/{{ req.id }}/package">Get key package</a>
+                    </p>
+                    <form method="post" action="/requests/{{ req.id }}/revoke" style="margin-top:8px">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button class="button secondary" type="submit">Revoke access</button>
+                    </form>
+                {% endif %}
+            </div>
+        {% endfor %}
+    {% else %}
+        <p class="notice">Nobody has asked for your data yet.</p>
+    {% endif %}
+</section>
+{% endblock %}

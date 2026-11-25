@@ -93,6 +93,7 @@ def _derive_keys(master_key, salt, algorithm):
 
     return encryption_key, mac_key
 
+
 def _encode_context(context):
     if not isinstance(context, dict):
         raise ValueError("Context harus berupa dictionary.")
@@ -115,8 +116,12 @@ def _encode_context(context):
     ):
         raise ValueError("owner_id harus integer positif, bukan boolean.")
 
-    if not isinstance(kind, str) or kind not in ("profile", "file"):
-        raise ValueError("kind harus profile atau file.")
+    if not isinstance(kind, str) or kind not in (
+        "profile", "file", "private_key", "share"
+    ):
+        raise ValueError(
+            "kind harus profile, file, private_key, atau share."
+        )
 
     if not isinstance(item_id, str):
         raise ValueError("item_id harus berupa string.")
@@ -126,6 +131,13 @@ def _encode_context(context):
             raise ValueError(
                 "item_id untuk profil harus berupa string profile."
             )
+
+    elif kind == "private_key":
+        if item_id != "private_key":
+            raise ValueError(
+                "item_id untuk private_key harus berupa string private_key."
+            )
+
     else:
         if len(item_id) != 36:
             raise ValueError(
@@ -135,19 +147,22 @@ def _encode_context(context):
         try:
             parsed_uuid = UUID(item_id)
         except ValueError:
-            raise ValueError("item_id berkas bukan UUID yang valid.") from None
+            raise ValueError(
+                "item_id berkas bukan UUID yang valid."
+            ) from None
 
         if str(parsed_uuid) != item_id:
             raise ValueError(
                 "item_id berkas harus UUID huruf kecil dengan tanda hubung."
             )
-            
+
     return json.dumps(
         context,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")
+
 
 def _validate_algorithm(algorithm):
     if not isinstance(algorithm, str) or algorithm not in ALGORITHMS:

@@ -1,4 +1,3 @@
-
 import sqlite3
 import tempfile
 import unittest
@@ -43,15 +42,16 @@ class DatabaseSharingTests(unittest.TestCase):
         self.connection.execute(
             """
             INSERT INTO share_requests (
-                id, requester_id, owner_id, category, expires_at
+                id, requester_id, owner_id, category, reason, expires_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
                 self.requester_id,
                 self.owner_id,
                 "document",
+                "Need it for a check-up",
                 "2026-12-02 08:00:00"
             )
         )
@@ -115,13 +115,14 @@ class DatabaseSharingTests(unittest.TestCase):
             """
             INSERT INTO user_keys (
                 user_id, public_key_pem,
-                encrypted_private_key, fingerprint
+                private_key_salt, encrypted_private_key, fingerprint
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 self.owner_id,
                 "public-key",
+                b"0" * 16,
                 b"encrypted-private-key",
                 "fingerprint-123"
             )
@@ -144,14 +145,15 @@ class DatabaseSharingTests(unittest.TestCase):
                 """
                 INSERT INTO user_keys (
                     user_id, public_key_pem,
-                    encrypted_private_key, fingerprint,
+                    private_key_salt, encrypted_private_key, fingerprint,
                     failed_unlock_count
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self.owner_id,
                     "public-key",
+                    b"0" * 16,
                     b"encrypted-key",
                     "fingerprint-1",
                     -1
@@ -163,13 +165,14 @@ class DatabaseSharingTests(unittest.TestCase):
             """
             INSERT INTO user_keys (
                 user_id, public_key_pem,
-                encrypted_private_key, fingerprint
+                private_key_salt, encrypted_private_key, fingerprint
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 self.requester_id,
                 "public-key-1",
+                b"0" * 16,
                 b"encrypted-1",
                 "same-fingerprint"
             )
@@ -180,13 +183,14 @@ class DatabaseSharingTests(unittest.TestCase):
                 """
                 INSERT INTO user_keys (
                     user_id, public_key_pem,
-                    encrypted_private_key, fingerprint
+                    private_key_salt, encrypted_private_key, fingerprint
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     self.owner_id,
                     "public-key-2",
+                    b"0" * 16,
                     b"encrypted-2",
                     "same-fingerprint"
                 )
@@ -207,15 +211,16 @@ class DatabaseSharingTests(unittest.TestCase):
             self.connection.execute(
                 """
                 INSERT INTO share_requests (
-                    id, requester_id, owner_id, category, expires_at
+                    id, requester_id, owner_id, category, reason, expires_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "request-invalid",
                     self.requester_id,
                     self.owner_id,
                     "invalid",
+                    "Need it for a check-up",
                     "2026-12-02 08:00:00"
                 )
             )
@@ -226,15 +231,16 @@ class DatabaseSharingTests(unittest.TestCase):
                 """
                 INSERT INTO share_requests (
                     id, requester_id, owner_id,
-                    category, status, expires_at
+                    category, reason, status, expires_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "request-invalid",
                     self.requester_id,
                     self.owner_id,
                     "document",
+                    "Need it for a check-up",
                     "invalid",
                     "2026-12-02 08:00:00"
                 )
@@ -245,15 +251,16 @@ class DatabaseSharingTests(unittest.TestCase):
             self.connection.execute(
                 """
                 INSERT INTO share_requests (
-                    id, requester_id, owner_id, category, expires_at
+                    id, requester_id, owner_id, category, reason, expires_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "request-same-user",
                     self.owner_id,
                     self.owner_id,
                     "document",
+                    "Need it for a check-up",
                     "2026-12-02 08:00:00"
                 )
             )
@@ -263,15 +270,16 @@ class DatabaseSharingTests(unittest.TestCase):
             self.connection.execute(
                 """
                 INSERT INTO share_requests (
-                    id, requester_id, owner_id, category, expires_at
+                    id, requester_id, owner_id, category, reason, expires_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "request-invalid-date",
                     self.requester_id,
                     self.owner_id,
                     "document",
+                    "Need it for a check-up",
                     "02-12-2026"
                 )
             )
@@ -294,11 +302,11 @@ class DatabaseSharingTests(unittest.TestCase):
             self.connection.execute(
                 """
                 INSERT INTO shared_items (
-                    id, request_id, storage_name
+                    id, request_id, category, storage_name
                 )
-                VALUES (?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 """,
-                ("item-1", "missing-request", "shared-file.enc")
+                ("item-1", "missing-request", "document", "shared-file.enc")
             )
 
     def test_shared_item_storage_name_must_be_unique(self):
@@ -306,19 +314,19 @@ class DatabaseSharingTests(unittest.TestCase):
 
         self.connection.execute(
             """
-            INSERT INTO shared_items (id, request_id, storage_name)
-            VALUES (?, ?, ?)
+            INSERT INTO shared_items (id, request_id, category, storage_name)
+            VALUES (?, ?, ?, ?)
             """,
-            ("item-1", "request-1", "shared-file.enc")
+            ("item-1", "request-1", "document", "shared-file.enc")
         )
 
         with self.assertRaises(sqlite3.IntegrityError):
             self.connection.execute(
                 """
-                INSERT INTO shared_items (id, request_id, storage_name)
-                VALUES (?, ?, ?)
+                INSERT INTO shared_items (id, request_id, category, storage_name)
+                VALUES (?, ?, ?, ?)
                 """,
-                ("item-2", "request-1", "shared-file.enc")
+                ("item-2", "request-1", "document", "shared-file.enc")
             )
 
     def test_audit_log_can_be_inserted(self):
@@ -352,11 +360,11 @@ class DatabaseSharingTests(unittest.TestCase):
                 """
                 INSERT INTO user_keys (
                     user_id, public_key_pem,
-                    encrypted_private_key, fingerprint
+                    private_key_salt, encrypted_private_key, fingerprint
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (999, "public-key", b"encrypted-key", "fingerprint-999")
+                (999, "public-key", b"0" * 16, b"encrypted-key", "fingerprint-999")
             )
 
     def test_delete_request_cascades_to_shared_items(self):
@@ -364,10 +372,10 @@ class DatabaseSharingTests(unittest.TestCase):
 
         self.connection.execute(
             """
-            INSERT INTO shared_items (id, request_id, storage_name)
-            VALUES (?, ?, ?)
+            INSERT INTO shared_items (id, request_id, category, storage_name)
+            VALUES (?, ?, ?, ?)
             """,
-            ("item-1", "request-1", "shared-file.enc")
+            ("item-1", "request-1", "document", "shared-file.enc")
         )
         self.connection.commit()
 
@@ -389,13 +397,14 @@ class DatabaseSharingTests(unittest.TestCase):
             """
             INSERT INTO user_keys (
                 user_id, public_key_pem,
-                encrypted_private_key, fingerprint
+                private_key_salt, encrypted_private_key, fingerprint
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 self.owner_id,
                 "public-key",
+                b"0" * 16,
                 b"encrypted-key",
                 "fingerprint-delete"
             )
@@ -416,6 +425,88 @@ class DatabaseSharingTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+    def test_pending_request_may_have_no_expiry(self):
+        self.connection.execute(
+            """
+            INSERT INTO share_requests (
+                id, requester_id, owner_id, category, reason
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "request-pending",
+                self.requester_id,
+                self.owner_id,
+                "document",
+                "Need it for a check-up"
+            )
+        )
+        result = self.connection.execute(
+            "SELECT status, expires_at, decided_at FROM share_requests WHERE id = ?",
+            ("request-pending",)
+        ).fetchone()
+
+        self.assertEqual(result["status"], "pending")
+        self.assertIsNone(result["expires_at"])
+        self.assertIsNone(result["decided_at"])
+
+    def test_share_request_rejects_empty_or_long_reason(self):
+        for reason in ("", "   ", "x" * 501):
+            with self.subTest(length=len(reason)):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.connection.execute(
+                        """
+                        INSERT INTO share_requests (
+                            id, requester_id, owner_id, category, reason
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "request-reason",
+                            self.requester_id,
+                            self.owner_id,
+                            "document",
+                            reason
+                        )
+                    )
+
+    def test_only_one_pending_request_per_pair(self):
+        self.create_share_request("request-1")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.create_share_request("request-2")
+
+        self.connection.execute(
+            "UPDATE share_requests SET status = 'rejected' WHERE id = ?",
+            ("request-1",)
+        )
+        self.create_share_request("request-2")
+
+    def test_user_keys_salt_must_be_16_bytes(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                """
+                INSERT INTO user_keys (
+                    user_id, public_key_pem, private_key_salt,
+                    encrypted_private_key, fingerprint
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (self.owner_id, "public-key", b"short", b"encrypted-key", "fp-salt")
+            )
+
+    def test_shared_item_rejects_invalid_category(self):
+        self.create_share_request()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                """
+                INSERT INTO shared_items (id, request_id, category, storage_name)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("item-1", "request-1", "invalid", "shared-file.enc")
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
-

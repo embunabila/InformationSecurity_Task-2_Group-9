@@ -1,4 +1,3 @@
-
 import sqlite3
 from pathlib import Path
 
@@ -68,6 +67,9 @@ def init_db():
                 public_key_pem TEXT NOT NULL
                     CHECK (length(trim(public_key_pem)) > 0),
 
+                private_key_salt BLOB NOT NULL
+                    CHECK (length(private_key_salt) = 16),
+
                 encrypted_private_key BLOB NOT NULL
                     CHECK (length(encrypted_private_key) > 0),
 
@@ -108,6 +110,12 @@ def init_db():
                         )
                     ),
 
+                reason TEXT NOT NULL
+                    CHECK (
+                        length(trim(reason)) > 0
+                        AND length(reason) <= 500
+                    ),
+
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (
                         status IN (
@@ -123,14 +131,19 @@ def init_db():
 
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-                expires_at TEXT NOT NULL
+                -- NULL while pending; set when the owner approves.
+                -- Format: 'YYYY-MM-DD HH:MM:SS' in Asia/Jakarta time.
+                expires_at TEXT
                     CHECK (
-                        length(expires_at) = 19
-                        AND expires_at GLOB
-                        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+                        expires_at IS NULL
+                        OR (
+                            length(expires_at) = 19
+                            AND expires_at GLOB
+                            '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+                        )
                     ),
 
-                responded_at TEXT,
+                decided_at TEXT,
 
                 CHECK (requester_id <> owner_id),
 
@@ -154,6 +167,16 @@ def init_db():
                 request_id TEXT NOT NULL,
 
                 source_file_id TEXT,
+
+                category TEXT NOT NULL
+                    CHECK (
+                        category IN (
+                            'profile',
+                            'identity',
+                            'document',
+                            'video'
+                        )
+                    ),
 
                 storage_name TEXT NOT NULL UNIQUE
                     CHECK (length(trim(storage_name)) > 0),
@@ -213,6 +236,11 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_share_requests_requester
                 ON share_requests(requester_id);
+
+            -- At most one pending request per requester/owner pair.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_share_requests_one_pending
+                ON share_requests(requester_id, owner_id)
+                WHERE status = 'pending';
 
             CREATE INDEX IF NOT EXISTS idx_share_requests_owner_status
                 ON share_requests(owner_id, status);

@@ -3,18 +3,27 @@
 
 import io
 import sqlite3
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import db
 
 from flask import (
     Blueprint,
     make_response,
     redirect,
+    render_template,
     request,
     send_file,
+    session,
     url_for,
 )
 
 from crypto_core import InvalidEnvelopeError
-from share_access import open_shared_item
+from share_access import (
+    expire_old_requests,
+    open_shared_item,
+)
 from share_errors import (
     InvalidKeyPackageError,
     KeyLockedError,
@@ -43,6 +52,95 @@ def _no_store(response):
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
+
+
+@access_bp.route("/shared", methods=["GET"])
+def shared_with_me():
+    """Show active health records shared with the current user."""
+    requester_id = current_user_id()
+
+    if requester_id is None:
+        return redirect(url_for("login"))
+
+    try:
+        # Remove expired requests and their shared copies first.
+        expire_old_requests()
+
+        now = datetime.now(
+            ZoneInfo("Asia/Jakarta")
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+        connection = db.get_connection()
+
+        try:
+            rows = connection.execute(
+                """
+                SELECT
+                    sr.id,
+                    sr.owner_id,
+                    u.username AS owner_username,
+                    sr.category,
+                    sr.created_at,
+                    sr.expires_at,
+                    si.id AS item_id,
+                    si.category AS item_category,
+                    si.created_at AS item_created_at
+                FROM share_requests AS sr
+                JOIN users AS u
+                    ON u.id = sr.owner_id
+                JOIN shared_items AS si
+                    ON si.request_id = sr.id
+                WHERE sr.requester_id = ?
+                    AND sr.status = 'approved'
+                    AND sr.expires_at > ?
+                ORDER BY sr.expires_at ASC,
+                    si.created_at ASC
+                """,
+                (requester_id, now),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        # Group multiple shared items under the same request.
+        shared_requests = {}
+
+        for row in rows:
+            request_id = row["id"]
+
+            if request_id not in shared_requests:
+                shared_requests[request_id] = {
+                    "id": request_id,
+                    "owner_id": row["owner_id"],
+                    "owner_username": row["owner_username"],
+                    "category": row["category"],
+                    "created_at": row["created_at"],
+                    "expires_at": row["expires_at"],
+                    "items": [],
+                }
+
+            shared_requests[request_id]["items"].append({
+                "id": row["item_id"],
+                "category": row["item_category"],
+                "created_at": row["item_created_at"],
+            })
+
+        response = make_response(
+            render_template(
+                "shared_view.html",
+                shared_requests=list(shared_requests.values()),
+                csrf_token=session.get("csrf_token", ""),
+            )
+        )
+
+        return _no_store(response)
+
+    except (sqlite3.Error, OSError):
+        return _no_store(
+            make_response(
+                "Data yang dibagikan tidak dapat dimuat. Coba lagi nanti.",
+                503,
+            )
+        )
 
 
 @access_bp.route(

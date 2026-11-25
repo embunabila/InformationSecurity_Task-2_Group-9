@@ -103,23 +103,34 @@
                                 autocomplete="current-password"
                             >
 
-                            <button
-                                class="button primary"
-                                type="submit"
-                                name="mode"
-                                value="view"
-                            >
-                                View file
-                            </button>
+                            {% if item["category"] == "profile" %}
+                                <button
+                                    class="button primary"
+                                    type="submit"
+                                    name="mode"
+                                    value="view"
+                                >
+                                    View profile
+                                </button>
+                            {% else %}
+                                <button
+                                    class="button primary"
+                                    type="submit"
+                                    name="mode"
+                                    value="view"
+                                >
+                                    View file
+                                </button>
 
-                            <button
-                                class="button secondary"
-                                type="submit"
-                                name="mode"
-                                value="download"
-                            >
-                                Download file
-                            </button>
+                                <button
+                                    class="button secondary"
+                                    type="submit"
+                                    name="mode"
+                                    value="download"
+                                >
+                                    Download file
+                                </button>
+                            {% endif %}
                         </form>
                     </div>
                 {% endfor %}

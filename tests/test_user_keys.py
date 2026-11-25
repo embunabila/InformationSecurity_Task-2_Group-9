@@ -62,6 +62,8 @@ from user_keys import (
     LOCKOUT_DURATION_MINUTES,
 )
 
+from user_keys import _recover_private_key
+
 class TestContextExtension(unittest.TestCase):
 
     def setUp(self):
@@ -1266,6 +1268,160 @@ class TestUserKeypairStorage(unittest.TestCase):
 
         self.assertEqual(self._keypair_count(), 0)
 
+    def test_duplicate_created_during_generation(self):
+        original_encrypt = encrypt_blob
+        inserted_row = {}
+
+        def simulate_concurrent_insert(
+            data, key, algorithm, context
+        ):
+            encrypted = original_encrypt(
+                data, key, algorithm, context
+            )
+
+            # Simulate another request completing generation
+            # before the original request starts its transaction.
+            with patch(
+                "user_keys.encrypt_blob",
+                side_effect=original_encrypt,
+            ):
+                generate_user_keypair(
+                    self.user_id,
+                    self.password,
+                )
+
+            inserted_row.update(
+                dict(self._read_keypair(self.user_id))
+            )
+
+            return encrypted
+
+        with patch(
+            "user_keys.encrypt_blob",
+            side_effect=simulate_concurrent_insert,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "User already has a keypair",
+            ):
+                generate_user_keypair(
+                    self.user_id,
+                    self.password,
+                )
+
+        self.assertEqual(self._keypair_count(), 1)
+
+        row = self._read_keypair(self.user_id)
+
+        self.assertEqual(dict(row), inserted_row)
+
+        # Confirm the surviving keypair remains usable.
+        private_der = self._decrypt_private_der(
+            row,
+            self.password,
+        )
+
+        recovered = RSA.import_key(private_der)
+
+        self.assertTrue(recovered.has_private())
+
+        self.assertEqual(
+            recovered.public_key()
+            .export_key(format="PEM")
+            .decode("ascii"),
+            row["public_key_pem"],
+        )
+
+    def test_password_hash_changes_during_generation(self):
+        original_encrypt = encrypt_blob
+
+        def simulate_password_hash_change(
+            data, key, algorithm, context
+        ):
+            encrypted = original_encrypt(
+                data, key, algorithm, context
+            )
+
+            with closing(db.get_connection()) as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        UPDATE users
+                        SET password_hash = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            self.other_password_hash,
+                            self.user_id,
+                        ),
+                    )
+
+            return encrypted
+
+        with patch(
+            "user_keys.encrypt_blob",
+            side_effect=simulate_password_hash_change,
+        ):
+            with self.assertRaises(KeyUnlockError):
+                generate_user_keypair(
+                    self.user_id,
+                    self.password,
+                )
+
+        self.assertEqual(self._keypair_count(), 0)
+
+        with closing(db.get_connection()) as connection:
+            row = connection.execute(
+                """
+                SELECT password_hash
+                FROM users
+                WHERE id = ?
+                """,
+                (self.user_id,),
+            ).fetchone()
+
+        self.assertEqual(
+            row["password_hash"],
+            self.other_password_hash,
+        )
+
+    def test_invalid_user_id(self):
+        invalid_ids = (
+            None,
+            True,
+            False,
+            0,
+            -1,
+            "1",
+            1.5,
+        )
+
+        with patch(
+            "user_keys.get_connection"
+        ) as mocked_db:
+
+            with patch(
+                "user_keys.RSA.generate"
+            ) as mocked_rsa:
+
+                for user_id in invalid_ids:
+                    with self.subTest(user_id=user_id):
+
+                        with self.assertRaises(ValueError):
+                            generate_user_keypair(
+                                user_id,
+                                self.password,
+                            )
+
+                        with self.assertRaises(ValueError):
+                            get_public_key(user_id)
+
+                mocked_rsa.assert_not_called()
+
+            mocked_db.assert_not_called()
+
+        self.assertEqual(self._keypair_count(), 0)
+
 
 class TestPrivateKeyUnlock(unittest.TestCase):
 
@@ -1935,6 +2091,428 @@ class TestPrivateKeyUnlock(unittest.TestCase):
             ),
         )
 
+    def test_recovered_rsa2048_private_key_is_rejected(self):
+        short_private_key = RSA.generate(2048)
+
+        private_der = short_private_key.export_key(
+            format="DER",
+            pkcs=8,
+        )
+
+        encrypted = self._encrypt_test_payload(
+            private_der
+        )
+
+        self._replace_encrypted_private_key(
+            encrypted
+        )
+
+        with self.assertRaises(KeyUnlockError):
+            unlock_private_key(
+                self.user_id,
+                self.password,
+            )
+
+        self.assertEqual(
+            self._read_state(),
+            (1, None),
+        )
+
+
+    def test_stored_public_key_mismatch_is_rejected(self):
+        other_private_key = RSA.generate(3072)
+
+        other_public_pem = (
+            other_private_key.public_key()
+            .export_key(format="PEM")
+            .decode("ascii")
+        )
+
+        other_fingerprint = public_key_fingerprint(
+            other_public_pem
+        )
+
+        with closing(db.get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE user_keys
+                    SET
+                        public_key_pem = ?,
+                        fingerprint = ?
+                    WHERE user_id = ?
+                    """,
+                    (
+                        other_public_pem,
+                        other_fingerprint,
+                        self.user_id,
+                    ),
+                )
+
+        with self.assertRaises(KeyUnlockError):
+            unlock_private_key(
+                self.user_id,
+                self.password,
+            )
+
+        self.assertEqual(
+            self._read_state(),
+            (1, None),
+        )
+
+    def test_stored_fingerprint_mismatch_is_rejected(self):
+        replacement_character = (
+            "A" if self.fingerprint[0] != "A" else "B"
+        )
+
+        wrong_fingerprint = (
+            replacement_character
+            + self.fingerprint[1:]
+        )
+
+        self.assertNotEqual(
+            wrong_fingerprint,
+            self.fingerprint,
+        )
+
+        with closing(db.get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE user_keys
+                    SET fingerprint = ?
+                    WHERE user_id = ?
+                    """,
+                    (
+                        wrong_fingerprint,
+                        self.user_id,
+                    ),
+                )
+
+        with self.assertRaises(KeyUnlockError):
+            unlock_private_key(
+                self.user_id,
+                self.password,
+            )
+
+        self.assertEqual(
+            self._read_state(),
+            (1, None),
+        )
+
+    def test_key_material_changes_during_unlock(self):
+        self._set_state(2)
+
+        original_der = self.private_key.export_key(
+            format="DER",
+            pkcs=8,
+        )
+
+        replacement_envelope = (
+            self._encrypt_test_payload(original_der)
+        )
+
+        self.assertNotEqual(
+            replacement_envelope,
+            self.encrypted_private_key,
+        )
+
+        def simulate_key_material_change(*args):
+            recovered = _recover_private_key(*args)
+
+            self._replace_encrypted_private_key(
+                replacement_envelope
+            )
+
+            return recovered
+
+        with patch(
+            "user_keys._recover_private_key",
+            side_effect=simulate_key_material_change,
+        ):
+            with self.assertRaises(KeyUnlockError):
+                unlock_private_key(
+                    self.user_id,
+                    self.password,
+                )
+
+        row = self._read_row()
+
+        self.assertEqual(
+            row["encrypted_private_key"],
+            replacement_envelope,
+        )
+
+        # A stale attempt must not reset or increment
+        # the security state of the changed key material.
+        self.assertEqual(
+            self._read_state(),
+            (2, None),
+        )
+
+        # A fresh attempt must still succeed.
+        recovered = unlock_private_key(
+            self.user_id,
+            self.password,
+        )
+
+        self._assert_key_matches(recovered)
+
+        self.assertEqual(
+            self._read_state(),
+            (0, None),
+        )
+
+    def test_keypair_deleted_during_unlock(self):
+        def simulate_keypair_deletion(*args):
+            recovered = _recover_private_key(*args)
+
+            with closing(db.get_connection()) as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        DELETE FROM user_keys
+                        WHERE user_id = ?
+                        """,
+                        (self.user_id,),
+                    )
+
+            return recovered
+
+        with patch(
+            "user_keys._recover_private_key",
+            side_effect=simulate_keypair_deletion,
+        ):
+            with self.assertRaises(KeyUnlockError):
+                unlock_private_key(
+                    self.user_id,
+                    self.password,
+                )
+
+        self.assertIsNone(self._read_row())
+
+    def test_database_update_failure_does_not_return_private_key(
+        self
+    ):
+        self._set_state(3)
+
+        original_row = dict(self._read_row())
+
+        with closing(db.get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    CREATE TRIGGER reject_test_unlock_update
+                    BEFORE UPDATE ON user_keys
+                    BEGIN
+                        SELECT RAISE(
+                            ABORT,
+                            'Simulated unlock update failure'
+                        );
+                    END;
+                    """
+                )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            unlock_private_key(
+                self.user_id,
+                self.password,
+            )
+
+        self.assertEqual(
+            self._read_state(),
+            (3, None),
+        )
+
+        self.assertEqual(
+            dict(self._read_row()),
+            original_row,
+        )
+
+        # Remove the simulated database failure.
+        with closing(db.get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    "DROP TRIGGER reject_test_unlock_update"
+                )
+
+        recovered = unlock_private_key(
+            self.user_id,
+            self.password,
+        )
+
+        self._assert_key_matches(recovered)
+
+        self.assertEqual(
+            self._read_state(),
+            (0, None),
+        )
+
+    def test_full_five_failure_sequence_followed_by_expiration(
+        self
+    ):
+        self.assertEqual(
+            self._read_state(),
+            (0, None),
+        )
+
+        # First four failures must not activate lockout.
+        for expected_count in range(1, 5):
+            with self.subTest(
+                failed_count=expected_count
+            ):
+                with self.assertRaises(KeyUnlockError):
+                    unlock_private_key(
+                        self.user_id,
+                        self.wrong_password,
+                    )
+
+                self.assertEqual(
+                    self._read_state(),
+                    (expected_count, None),
+                )
+
+        # Fifth failure activates lockout.
+        with self.assertRaises(KeyLockedError):
+            unlock_private_key(
+                self.user_id,
+                self.wrong_password,
+            )
+
+        deadline = self.now + timedelta(minutes=15)
+
+        self.assertEqual(
+            self._read_state(),
+            (5, deadline.isoformat()),
+        )
+
+        # One second before expiration: still locked.
+        self.mocked_clock.return_value = (
+            deadline - timedelta(seconds=1)
+        )
+
+        with patch(
+            "user_keys._derive_kek"
+        ) as mocked_kek:
+            with self.assertRaises(KeyLockedError):
+                unlock_private_key(
+                    self.user_id,
+                    self.password,
+                )
+
+            mocked_kek.assert_not_called()
+
+        self.assertEqual(
+            self._read_state(),
+            (5, deadline.isoformat()),
+        )
+
+        # At the exact expiration boundary,
+        # a wrong password starts a new failure sequence.
+        self.mocked_clock.return_value = deadline
+
+        with self.assertRaises(KeyUnlockError):
+            unlock_private_key(
+                self.user_id,
+                self.wrong_password,
+            )
+
+        self.assertEqual(
+            self._read_state(),
+            (1, None),
+        )
+
+        # A successful unlock resets the new counter.
+        recovered = unlock_private_key(
+            self.user_id,
+            self.password,
+        )
+
+        self._assert_key_matches(recovered)
+
+        self.assertEqual(
+            self._read_state(),
+            (0, None),
+        )
+
+    def test_concurrent_failures_remain_capped_at_five(self):
+        self._set_state(4)
+
+        workers = 3
+        barrier = Barrier(workers)
+
+        def simulated_failure(*args):
+            barrier.wait(timeout=10)
+
+            raise KeyUnlockError(
+                "Simulated incorrect password."
+            )
+
+        def attempt():
+            try:
+                unlock_private_key(
+                    self.user_id,
+                    self.wrong_password,
+                )
+
+            except KeyLockedError:
+                return "locked"
+
+            except KeyUnlockError:
+                return "failed"
+
+            return "unexpected"
+
+        with patch(
+            "user_keys._recover_private_key",
+            side_effect=simulated_failure,
+        ) as mocked_recovery:
+
+            with ThreadPoolExecutor(
+                max_workers=workers
+            ) as executor:
+
+                futures = [
+                    executor.submit(attempt)
+                    for _ in range(workers)
+                ]
+
+                results = [
+                    future.result(timeout=20)
+                    for future in futures
+                ]
+
+        self.assertEqual(
+            mocked_recovery.call_count,
+            workers,
+        )
+
+        self.assertCountEqual(
+            results,
+            ["locked"] * workers,
+        )
+
+        expected_deadline = (
+            self.now + timedelta(minutes=15)
+        ).isoformat()
+
+        self.assertEqual(
+            self._read_state(),
+            (5, expected_deadline),
+        )
+
+        # Further attempts must not increase the counter
+        # or extend the lockout.
+        with self.assertRaises(KeyLockedError):
+            unlock_private_key(
+                self.user_id,
+                self.wrong_password,
+            )
+
+        self.assertEqual(
+            self._read_state(),
+            (5, expected_deadline),
+        )
 
 if __name__ == "__main__":
     unittest.main()

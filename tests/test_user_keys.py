@@ -34,6 +34,22 @@ from user_keys import (
     SCRYPT_P,
 )
 
+import sqlite3
+from contextlib import closing
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from werkzeug.security import generate_password_hash
+
+import db
+from share_errors import KeyUnlockError
+
+from user_keys import (
+    generate_user_keypair,
+    get_public_key,
+    _private_key_context,
+)
+
 class TestContextExtension(unittest.TestCase):
 
     def setUp(self):
@@ -791,6 +807,453 @@ class TestKEKDerivation(unittest.TestCase):
             )
 
             self.assertEqual(result, bytes(32))
+
+
+class TestUserKeypairStorage(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.password = "MedimoDummyPassword123!"
+
+        cls.password_hash = generate_password_hash(
+            cls.password,
+            method="scrypt:131072:8:1",
+        )
+
+        cls.other_password = "AnotherDummyPassword456!"
+
+        cls.other_password_hash = generate_password_hash(
+            cls.other_password,
+            method="scrypt:131072:8:1",
+        )
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+        self.db_path = (
+            Path(self.temp_dir.name) / "test_medimo.db"
+        )
+
+        self.db_patch = patch.object(
+            db,
+            "DB_PATH",
+            self.db_path,
+        )
+
+        self.db_patch.start()
+        self.addCleanup(self.db_patch.stop)
+
+        db.init_db()
+
+        with closing(db.get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO users (
+                        id, username, password_hash
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (1, "dummy_user", self.password_hash),
+                )
+
+                connection.execute(
+                    """
+                    INSERT INTO users (
+                        id, username, password_hash
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        2,
+                        "other_user",
+                        self.other_password_hash,
+                    ),
+                )
+
+        self.user_id = 1
+        self.other_user_id = 2
+
+    def _read_keypair(self, user_id):
+        with closing(db.get_connection()) as connection:
+            return connection.execute(
+                """
+                SELECT *
+                FROM user_keys
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+
+    def _keypair_count(self):
+        with closing(db.get_connection()) as connection:
+            return connection.execute(
+                "SELECT COUNT(*) FROM user_keys"
+            ).fetchone()[0]
+
+    def _generate_keypair(self):
+        generate_user_keypair(
+            self.user_id,
+            self.password,
+        )
+
+        row = self._read_keypair(self.user_id)
+
+        self.assertIsNotNone(row)
+
+        return row
+
+    def _decrypt_private_der(self, row, password):
+        kek = _derive_kek(
+            password,
+            row["private_key_salt"],
+        )
+
+        context = _private_key_context(row["user_id"])
+
+        return decrypt_blob(
+            row["encrypted_private_key"],
+            kek,
+            "AES",
+            context,
+        )
+
+    def test_generate_keypair_success(self):
+        result = generate_user_keypair(
+            self.user_id,
+            self.password,
+        )
+
+        self.assertIsNone(result)
+        self.assertIsNotNone(
+            self._read_keypair(self.user_id)
+        )
+        self.assertEqual(self._keypair_count(), 1)
+
+    def test_get_public_key_without_keypair(self):
+        self.assertIsNone(
+            get_public_key(self.user_id)
+        )
+
+    def test_get_public_key_unknown_user(self):
+        self.assertIsNone(get_public_key(999))
+
+    def test_get_public_key_returns_only_public_data(self):
+        row = self._generate_keypair()
+
+        result = get_public_key(self.user_id)
+
+        self.assertEqual(
+            result,
+            {
+                "public_key_pem": row["public_key_pem"],
+                "fingerprint": row["fingerprint"],
+            },
+        )
+
+        self.assertEqual(
+            set(result),
+            {"public_key_pem", "fingerprint"},
+        )
+
+    def test_generated_public_key_is_rsa3072(self):
+        row = self._generate_keypair()
+
+        public_key = RSA.import_key(
+            row["public_key_pem"]
+        )
+
+        self.assertIsInstance(
+            row["public_key_pem"],
+            str,
+        )
+
+        self.assertEqual(
+            public_key.size_in_bits(),
+            3072,
+        )
+
+        self.assertFalse(public_key.has_private())
+
+        self.assertTrue(
+            row["public_key_pem"].startswith(
+                "-----BEGIN PUBLIC KEY-----"
+            )
+        )
+
+    def test_stored_fingerprint_matches_public_key(self):
+        row = self._generate_keypair()
+
+        expected = public_key_fingerprint(
+            row["public_key_pem"]
+        )
+
+        self.assertEqual(
+            row["fingerprint"],
+            expected,
+        )
+
+    def test_stored_salt_is_16_bytes(self):
+        row = self._generate_keypair()
+
+        salt = row["private_key_salt"]
+
+        self.assertIsInstance(salt, bytes)
+        self.assertEqual(len(salt), 16)
+
+    def test_private_key_is_stored_as_aes_envelope(self):
+        row = self._generate_keypair()
+
+        encrypted = row["encrypted_private_key"]
+
+        self.assertIsInstance(encrypted, bytes)
+
+        self.assertEqual(encrypted[:4], b"MDMO")
+        self.assertEqual(encrypted[4], 1)
+        self.assertEqual(encrypted[5], 1)
+
+        # The encrypted envelope is not an importable RSA key.
+        with self.assertRaises(
+            (ValueError, IndexError, TypeError)
+        ):
+            RSA.import_key(encrypted)
+
+    def test_private_key_decrypts_and_matches_public_key(self):
+        row = self._generate_keypair()
+
+        private_der = self._decrypt_private_der(
+            row,
+            self.password,
+        )
+
+        private_key = RSA.import_key(private_der)
+
+        self.assertTrue(private_key.has_private())
+        self.assertEqual(
+            private_key.size_in_bits(),
+            3072,
+        )
+
+        expected_public_pem = (
+            private_key.public_key()
+            .export_key(format="PEM")
+            .decode("ascii")
+        )
+
+        self.assertEqual(
+            expected_public_pem,
+            row["public_key_pem"],
+        )
+
+        self.assertEqual(
+            private_der,
+            private_key.export_key(
+                format="DER",
+                pkcs=8,
+            ),
+        )
+
+        self.assertNotEqual(
+            row["encrypted_private_key"],
+            private_der,
+        )
+
+    def test_wrong_password_rejects_generation(self):
+        with patch("user_keys.RSA.generate") as mocked_rsa:
+            with patch("user_keys._derive_kek") as mocked_kek:
+
+                with self.assertRaises(KeyUnlockError):
+                    generate_user_keypair(
+                        self.user_id,
+                        "WrongPassword123!",
+                    )
+
+                mocked_rsa.assert_not_called()
+                mocked_kek.assert_not_called()
+
+        self.assertEqual(self._keypair_count(), 0)
+
+    def test_invalid_password_rejects_generation(self):
+        with patch("user_keys.RSA.generate") as mocked_rsa:
+            for password in ("", None, 123, b"password"):
+                with self.subTest(password=password):
+                    with self.assertRaises(KeyUnlockError):
+                        generate_user_keypair(
+                            self.user_id,
+                            password,
+                        )
+
+            mocked_rsa.assert_not_called()
+
+        self.assertEqual(self._keypair_count(), 0)
+
+    def test_unknown_user_rejects_generation(self):
+        with patch("user_keys.RSA.generate") as mocked_rsa:
+            with self.assertRaises(ValueError):
+                generate_user_keypair(
+                    999,
+                    self.password,
+                )
+
+            mocked_rsa.assert_not_called()
+
+        self.assertEqual(self._keypair_count(), 0)
+
+    def test_duplicate_keypair_is_rejected_without_overwrite(self):
+        original_row = dict(self._generate_keypair())
+
+        with patch("user_keys.RSA.generate") as mocked_rsa:
+            with self.assertRaises(ValueError):
+                generate_user_keypair(
+                    self.user_id,
+                    self.password,
+                )
+
+            mocked_rsa.assert_not_called()
+
+        current_row = dict(
+            self._read_keypair(self.user_id)
+        )
+
+        self.assertEqual(current_row, original_row)
+        self.assertEqual(self._keypair_count(), 1)
+
+    def test_wrong_password_cannot_decrypt_private_key(self):
+        row = self._generate_keypair()
+
+        wrong_kek = _derive_kek(
+            "WrongPassword123!",
+            row["private_key_salt"],
+        )
+
+        with self.assertRaises(InvalidEnvelopeError):
+            decrypt_blob(
+                row["encrypted_private_key"],
+                wrong_kek,
+                "AES",
+                _private_key_context(self.user_id),
+            )
+
+    def test_wrong_owner_context_rejects_private_key(self):
+        row = self._generate_keypair()
+
+        kek = _derive_kek(
+            self.password,
+            row["private_key_salt"],
+        )
+
+        wrong_context = _private_key_context(
+            self.other_user_id
+        )
+
+        with self.assertRaises(InvalidEnvelopeError):
+            decrypt_blob(
+                row["encrypted_private_key"],
+                kek,
+                "AES",
+                wrong_context,
+            )
+
+    def test_tampered_private_key_envelope_is_rejected(self):
+        row = self._generate_keypair()
+
+        kek = _derive_kek(
+            self.password,
+            row["private_key_salt"],
+        )
+
+        tampered = bytearray(
+            row["encrypted_private_key"]
+        )
+
+        tampered[-1] ^= 0x01
+
+        with self.assertRaises(InvalidEnvelopeError):
+            decrypt_blob(
+                bytes(tampered),
+                kek,
+                "AES",
+                _private_key_context(self.user_id),
+            )
+
+    def test_initial_lockout_state(self):
+        row = self._generate_keypair()
+
+        self.assertEqual(
+            row["failed_unlock_count"],
+            0,
+        )
+
+        self.assertIsNone(row["locked_until"])
+        self.assertIsNotNone(row["created_at"])
+
+    def test_different_users_have_independent_keypairs(self):
+        first_row = self._generate_keypair()
+
+        generate_user_keypair(
+            self.other_user_id,
+            self.other_password,
+        )
+
+        second_row = self._read_keypair(
+            self.other_user_id
+        )
+
+        self.assertEqual(self._keypair_count(), 2)
+
+        self.assertNotEqual(
+            first_row["public_key_pem"],
+            second_row["public_key_pem"],
+        )
+
+        self.assertNotEqual(
+            first_row["fingerprint"],
+            second_row["fingerprint"],
+        )
+
+        self.assertNotEqual(
+            first_row["private_key_salt"],
+            second_row["private_key_salt"],
+        )
+
+    def test_encryption_failure_does_not_store_keypair(self):
+        with patch(
+            "user_keys.encrypt_blob",
+            side_effect=RuntimeError("Simulated failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                generate_user_keypair(
+                    self.user_id,
+                    self.password,
+                )
+
+        self.assertEqual(self._keypair_count(), 0)
+
+    def test_database_failure_does_not_store_keypair(self):
+        with closing(db.get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    CREATE TRIGGER reject_test_keypair
+                    BEFORE INSERT ON user_keys
+                    BEGIN
+                        SELECT RAISE(
+                            ABORT,
+                            'Simulated database failure'
+                        );
+                    END;
+                    """
+                )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            generate_user_keypair(
+                self.user_id,
+                self.password,
+            )
+
+        self.assertEqual(self._keypair_count(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

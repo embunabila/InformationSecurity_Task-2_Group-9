@@ -14,6 +14,7 @@ from share_errors import (
     ShareAccessError,
 )
 
+
 class AccessRoutesTests(unittest.TestCase):
 
     def setUp(self):
@@ -186,6 +187,74 @@ class AccessRoutesTests(unittest.TestCase):
 
         open_item.assert_called_once()
 
+    def test_profile_is_displayed_as_table_not_downloaded(self):
+        metadata = {
+            "filename": "profil.json",
+            "mime": "application/json",
+        }
+        profile_data = (
+            b'{"name":"Test User","birth_date":"2005-01-01",'
+            b'"gender":"perempuan","weight":"50","height":"160"}'
+        )
+
+        with patch.object(
+            self.access_routes,
+            "open_shared_item",
+            return_value=(metadata, profile_data),
+        ) as open_item:
+            response = self.post_shared_item(
+                self.make_data(mode="download")
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "text/html")
+        self.assertNotIn(
+            "attachment",
+            response.headers.get("Content-Disposition", ""),
+        )
+
+        page = response.get_data(as_text=True)
+        self.assertIn("<table", page)
+        self.assertIn("Profile Information", page)
+        self.assertIn("Test User", page)
+        self.assertIn("Birth date", page)
+        self.assertIn("perempuan", page)
+
+        self.assertEqual(
+            response.headers["Cache-Control"],
+            "no-store",
+        )
+        self.assertEqual(
+            response.headers["X-Content-Type-Options"],
+            "nosniff",
+        )
+
+        open_item.assert_called_once()
+
+    def test_invalid_profile_json_returns_server_error(self):
+        metadata = {
+            "filename": "profil.json",
+            "mime": "application/json",
+        }
+
+        with patch.object(
+            self.access_routes,
+            "open_shared_item",
+            return_value=(metadata, b"not valid json"),
+        ):
+            response = self.post_shared_item(
+                self.make_data(mode="view")
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(
+            "Data tidak dapat dibuka.",
+            response.get_data(as_text=True),
+        )
+        self.assertEqual(
+            response.headers["Cache-Control"],
+            "no-store",
+        )
 
     def test_key_verification_errors_return_400(self):
         errors = (
@@ -260,6 +329,7 @@ class AccessRoutesTests(unittest.TestCase):
             response = self.post_shared_item()
 
         self.assertEqual(response.status_code, 503)
+
 
 if __name__ == "__main__":
     unittest.main()

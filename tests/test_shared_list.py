@@ -150,8 +150,6 @@ class SharedListTests(unittest.TestCase):
 
         self.assertIn("owner", page)
         self.assertIn("Health Profile", page)
-
-        # Another user's shared item must not appear.
         self.assertNotIn("Medical Video", page)
 
         expire_requests.assert_called_once()
@@ -171,6 +169,27 @@ class SharedListTests(unittest.TestCase):
             response.headers["X-Content-Type-Options"],
             "nosniff",
         )
+
+    def test_creates_csrf_token_when_session_has_none(self):
+        with self.client.session_transaction() as session:
+            session.pop("csrf_token", None)
+
+        with patch.object(
+            self.access_routes,
+            "expire_old_requests",
+        ):
+            response = self.client.get("/shared")
+
+        self.assertEqual(response.status_code, 200)
+
+        with self.client.session_transaction() as session:
+            csrf_token = session.get("csrf_token")
+
+        self.assertIsNotNone(csrf_token)
+        self.assertEqual(len(csrf_token), 64)
+
+        # Confirm that the token contains valid hexadecimal characters.
+        int(csrf_token, 16)
 
 
 if __name__ == "__main__":

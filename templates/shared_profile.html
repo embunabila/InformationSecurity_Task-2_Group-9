@@ -1,0 +1,48 @@
+
+{% extends "app_base.html" %}
+
+{% block title %}Shared Health Profile — Medimo{% endblock %}
+
+{% block content %}
+<header class="top">
+    <div>
+        <span class="eyebrow">DATA SHARING</span>
+        <h1>Shared Health Profile</h1>
+        <p class="muted">
+            Health profile information shared with you.
+        </p>
+    </div>
+</header>
+
+<section class="card panel">
+    <span class="eyebrow">HEALTH PROFILE</span>
+    <h2>Profile Information</h2>
+
+    {% if profile_fields %}
+        <table>
+            <tbody>
+                {% for field in profile_fields %}
+                    <tr>
+                        <th scope="row">{{ field["label"] }}</th>
+                        <td>
+                            {% if field["value"] is not none and field["value"] != "" %}
+                                {{ field["value"] }}
+                            {% else %}
+                                Not provided
+                            {% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <div class="notice">
+            No profile information was shared.
+        </div>
+    {% endif %}
+
+    <a class="button secondary" href="{{ url_for('access.shared_with_me') }}">
+        Back to shared records
+    </a>
+</section>
+{% endblock %}

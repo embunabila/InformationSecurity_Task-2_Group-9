@@ -9,7 +9,12 @@ from crypto_core import decrypt_blob
 from file_payload import unpack_file_payload
 from share_errors import InvalidKeyPackageError, ShareAccessError
 from share_keys import parse_key_package
+from share_requests import (
+    get_active_request_for_requester,
+    record_share_event,
+)
 from storage import delete_envelope, read_envelope
+from user_keys import get_public_key, unlock_private_key, unwrap_key
 
 def _validate_key_package(package_text, request_id, recipient_fingerprint):
     """Validate a key package against the request and recipient."""
@@ -60,14 +65,91 @@ def open_shared_item(
     package_text,
     password,
 ):
-    """Open one shared item.
+    """Open one item shared with the authenticated requester."""
 
-    Full orchestration will be completed when the requester-key and
-    sharing-database interfaces are available.
-    """
-    raise NotImplementedError(
-        "Waiting for user-key and share-request database interfaces."
+    # 1. Expire old requests before checking access.
+    expire_old_requests()
+
+    # 2. Confirm the request is approved, unexpired, and belongs
+    #    to the current requester.
+    shared_request = get_active_request_for_requester(
+        requester_id,
+        request_id,
     )
+
+    # 3. Get the requester's public key fingerprint.
+    key_info = get_public_key(requester_id)
+
+    if key_info is None:
+        raise ShareAccessError(
+            "Buat kunci di halaman Kunci saya terlebih dahulu."
+        )
+
+    # 4. Validate the key package against the request and fingerprint.
+    wrapped_key = _validate_key_package(
+        package_text,
+        request_id,
+        key_info["fingerprint"],
+    )
+
+    # Ensure the supplied package contains the wrapped key
+    # stored for this approved request.
+    if wrapped_key != shared_request["wrapped_key"]:
+        raise InvalidKeyPackageError(
+            "Wrapped key does not match the approved request."
+        )
+
+    # 5. Unlock the requester's private key.
+    private_key = unlock_private_key(
+        requester_id,
+        password,
+    )
+
+    # 6. Recover the original share key.
+    share_key = unwrap_key(
+        wrapped_key,
+        private_key,
+        request_id,
+    )
+
+    # 7. Find the requested item within this specific request.
+    connection = db.get_connection()
+
+    try:
+        item = connection.execute(
+            """
+            SELECT id, storage_name
+            FROM shared_items
+            WHERE id = ?
+              AND request_id = ?
+            """,
+            (item_id, request_id),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    if item is None:
+        raise ShareAccessError(
+            "Shared item is not available."
+        )
+
+    # 8. Read and decrypt the shared envelope.
+    metadata, file_bytes = _decrypt_shared_envelope(
+        item["storage_name"],
+        share_key,
+        shared_request["owner_id"],
+        item_id,
+    )
+
+    # 9. Record successful access.
+    record_share_event(
+        request_id,
+        requester_id,
+        "opened",
+    )
+
+    # 10. Return the decrypted file.
+    return metadata, file_bytes
 
 
 

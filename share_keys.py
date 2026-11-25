@@ -1,6 +1,9 @@
 """Create encrypted share copies and the wrapped share key."""
 
+import base64
+import binascii
 import json
+import re
 import uuid
 
 from Crypto.Random import get_random_bytes
@@ -8,6 +11,7 @@ from Crypto.Random import get_random_bytes
 from crypto_core import decrypt_blob, encrypt_blob
 from db import get_health_profile_envelopes, get_medical_file
 from file_payload import pack_file_payload
+from share_errors import InvalidKeyPackageError
 from storage import delete_envelope, read_envelope, write_envelope
 from user_keys import wrap_key
 
@@ -20,6 +24,17 @@ PROFILE_COPY_METADATA = {
     "filename": "profil.json",
     "mime": "application/json",
 }
+
+
+KEY_PACKAGE_PREFIX = "MEDIMO-KEY-1:"
+KEY_PACKAGE_VERSION = 1
+KEY_PACKAGE_FIELDS = {"recipient_fp", "request_id", "v", "wrapped_key"}
+KEY_PACKAGE_MAX_LENGTH = 4096
+WRAPPED_KEY_SIZE = 384  # RSA-3072 OAEP output
+
+# SHA-256 as uppercase hex in 16 groups of 4, e.g. "3F2A 91C0 ...".
+FINGERPRINT_PATTERN = re.compile(r"[0-9A-F]{4}(?: [0-9A-F]{4}){15}")
+BASE64URL_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def _validate_owner_id(owner_id):
@@ -186,3 +201,121 @@ def create_share(
         raise
 
     return {"wrapped_key": wrapped_key, "shared_items": shared_items}
+
+def _encode_key_package(fields):
+    json_bytes = json.dumps(
+        fields,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+    # base64url without "=" padding, so the text is safe to paste anywhere.
+    body = base64.urlsafe_b64encode(json_bytes).rstrip(b"=").decode("ascii")
+
+    return KEY_PACKAGE_PREFIX + body
+
+
+def build_key_package(request_id, wrapped_key, recipient_fingerprint):
+    """Build the text package the owner sends to the requester."""
+    _validate_uuid(request_id, "request_id")
+
+    if not isinstance(wrapped_key, bytes) or len(wrapped_key) != WRAPPED_KEY_SIZE:
+        raise ValueError(f"wrapped_key must be {WRAPPED_KEY_SIZE} bytes.")
+
+    if not isinstance(recipient_fingerprint, str) or not FINGERPRINT_PATTERN.fullmatch(
+        recipient_fingerprint
+    ):
+        raise ValueError("recipient_fingerprint has an invalid format.")
+
+    return _encode_key_package(
+        {
+            "recipient_fp": recipient_fingerprint,
+            "request_id": request_id,
+            "v": KEY_PACKAGE_VERSION,
+            "wrapped_key": base64.b64encode(wrapped_key).decode("ascii"),
+        }
+    )
+
+
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate field")
+        result[key] = value
+    return result
+
+
+def parse_key_package(text):
+    """Parse and validate a pasted key package.
+
+    Returns recipient_fp, request_id, v and wrapped_key (as bytes).
+    Any problem raises InvalidKeyPackageError.
+    """
+    if not isinstance(text, str):
+        raise InvalidKeyPackageError("Key package must be text.")
+
+    # Copying from chat apps often adds surrounding whitespace.
+    text = text.strip()
+
+    if len(text) > KEY_PACKAGE_MAX_LENGTH:
+        raise InvalidKeyPackageError("Key package is too long.")
+
+    if not text.startswith(KEY_PACKAGE_PREFIX):
+        raise InvalidKeyPackageError("Unknown key package format.")
+
+    body = text[len(KEY_PACKAGE_PREFIX):]
+
+    if not BASE64URL_PATTERN.fullmatch(body):
+        raise InvalidKeyPackageError("Key package is not valid base64url.")
+
+    try:
+        json_bytes = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        fields = json.loads(
+            json_bytes.decode("ascii"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (binascii.Error, ValueError, UnicodeDecodeError, RecursionError):
+        raise InvalidKeyPackageError("Key package could not be decoded.") from None
+
+    if not isinstance(fields, dict) or set(fields) != KEY_PACKAGE_FIELDS:
+        raise InvalidKeyPackageError("Key package has unexpected fields.")
+
+    version = fields["v"]
+    # Exact int only: True and 1.0 both compare equal to 1.
+    if type(version) is not int or version != KEY_PACKAGE_VERSION:
+        raise InvalidKeyPackageError("Unsupported key package version.")
+
+    try:
+        _validate_uuid(fields["request_id"], "request_id")
+    except ValueError:
+        raise InvalidKeyPackageError("Key package has an invalid request id.") from None
+
+    fingerprint = fields["recipient_fp"]
+    if not isinstance(fingerprint, str) or not FINGERPRINT_PATTERN.fullmatch(
+        fingerprint
+    ):
+        raise InvalidKeyPackageError("Key package has an invalid fingerprint.")
+
+    encoded_key = fields["wrapped_key"]
+    if not isinstance(encoded_key, str):
+        raise InvalidKeyPackageError("Key package has an invalid wrapped key.")
+
+    try:
+        wrapped_key = base64.b64decode(encoded_key, validate=True)
+    except (binascii.Error, ValueError):
+        raise InvalidKeyPackageError("Key package has an invalid wrapped key.") from None
+
+    if len(wrapped_key) != WRAPPED_KEY_SIZE:
+        raise InvalidKeyPackageError("Key package has an invalid wrapped key.")
+
+    # Only the exact form build_key_package produces is accepted.
+    if build_key_package(fields["request_id"], wrapped_key, fingerprint) != text:
+        raise InvalidKeyPackageError("Key package is not in canonical form.")
+
+    return {
+        "recipient_fp": fingerprint,
+        "request_id": fields["request_id"],
+        "v": version,
+        "wrapped_key": wrapped_key,
+    }

@@ -1,3 +1,4 @@
+import base64
 import importlib
 import importlib.util
 import json
@@ -335,6 +336,157 @@ class CreateShareTests(unittest.TestCase):
             {"name": "Dummy", "allergies": "Penisilin"},
         )
 
+
+REQUEST_ID = "0b9f3c2e-6d41-4c8a-9e57-2f1a8b3c4d5e"
+WRAPPED_KEY = bytes(range(256)) + bytes(range(128))
+FINGERPRINT = " ".join(["3F2A", "91C0"] * 8)
+
+
+def _raw_package(fields):
+    """Encode any JSON (dict or raw string) the way a package is encoded."""
+    text = fields if isinstance(fields, str) else json.dumps(
+        fields, sort_keys=True, separators=(",", ":")
+    )
+    body = base64.urlsafe_b64encode(text.encode("utf-8")).rstrip(b"=")
+    return "MEDIMO-KEY-1:" + body.decode("ascii")
+
+
+def _valid_fields(**changes):
+    fields = {
+        "recipient_fp": FINGERPRINT,
+        "request_id": REQUEST_ID,
+        "v": 1,
+        "wrapped_key": base64.b64encode(WRAPPED_KEY).decode("ascii"),
+    }
+    fields.update(changes)
+    return fields
+
+
+class KeyPackageTests(unittest.TestCase):
+    def setUp(self):
+        if importlib.util.find_spec("user_keys") is None:
+            stub = types.ModuleType("user_keys")
+            stub.wrap_key = None
+            modules_patcher = patch.dict(sys.modules, {"user_keys": stub})
+            modules_patcher.start()
+            self.addCleanup(modules_patcher.stop)
+
+        sys.modules.pop("share_keys", None)
+        self.share_keys = importlib.import_module("share_keys")
+        self.addCleanup(sys.modules.pop, "share_keys", None)
+
+        self.error = importlib.import_module("share_errors").InvalidKeyPackageError
+
+    def _build(self):
+        return self.share_keys.build_key_package(REQUEST_ID, WRAPPED_KEY, FINGERPRINT)
+
+    def test_round_trip(self):
+        package = self._build()
+
+        self.assertEqual(
+            self.share_keys.parse_key_package(package),
+            {
+                "recipient_fp": FINGERPRINT,
+                "request_id": REQUEST_ID,
+                "v": 1,
+                "wrapped_key": WRAPPED_KEY,
+            },
+        )
+
+    def test_package_is_plain_ascii_text(self):
+        package = self._build()
+        body = package[len("MEDIMO-KEY-1:"):]
+
+        self.assertTrue(package.startswith("MEDIMO-KEY-1:"))
+        self.assertLessEqual(len(package), 4096)
+        self.assertRegex(body, r"\A[A-Za-z0-9_-]+\Z")
+        self.assertEqual(package, self._build())
+
+    def test_package_matches_documented_json(self):
+        self.assertEqual(self._build(), _raw_package(_valid_fields()))
+
+    def test_parse_ignores_surrounding_whitespace(self):
+        result = self.share_keys.parse_key_package("\n  " + self._build() + " \r\n")
+        self.assertEqual(result["wrapped_key"], WRAPPED_KEY)
+
+    def test_build_rejects_invalid_arguments(self):
+        cases = (
+            (REQUEST_ID.upper(), WRAPPED_KEY, FINGERPRINT),
+            ("not-a-uuid", WRAPPED_KEY, FINGERPRINT),
+            (REQUEST_ID, WRAPPED_KEY[:-1], FINGERPRINT),
+            (REQUEST_ID, WRAPPED_KEY + b"x", FINGERPRINT),
+            (REQUEST_ID, WRAPPED_KEY.hex(), FINGERPRINT),
+            (REQUEST_ID, WRAPPED_KEY, FINGERPRINT.lower()),
+            (REQUEST_ID, WRAPPED_KEY, FINGERPRINT.replace(" ", "")),
+            (REQUEST_ID, WRAPPED_KEY, FINGERPRINT[:-5]),
+            (REQUEST_ID, WRAPPED_KEY, None),
+        )
+        for request_id, wrapped_key, fingerprint in cases:
+            with self.subTest(request_id=request_id, fingerprint=fingerprint):
+                with self.assertRaises(ValueError):
+                    self.share_keys.build_key_package(
+                        request_id, wrapped_key, fingerprint
+                    )
+
+    def test_parse_rejects_malformed_text(self):
+        package = self._build()
+        body = package[len("MEDIMO-KEY-1:"):]
+
+        cases = (
+            None,
+            package.encode("ascii"),
+            "",
+            body,
+            "MEDIMO-KEY-2:" + body,
+            "medimo-key-1:" + body,
+            "MEDIMO-KEY-1:",
+            package + "=",
+            package[:-4] + "+/+/",
+            package[:-10],
+            package + "A" * 4096,
+            "MEDIMO-KEY-1:" + "A" * 50,
+            _raw_package("[1, 2, 3]"),
+            _raw_package("not json"),
+            _raw_package("[" * 2000 + "]" * 2000),
+        )
+        for text in cases:
+            with self.subTest(text=repr(text)[:40]):
+                with self.assertRaises(self.error):
+                    self.share_keys.parse_key_package(text)
+
+    def test_parse_rejects_bad_fields(self):
+        missing = _valid_fields()
+        del missing["v"]
+        valid_json = json.dumps(_valid_fields(), sort_keys=True, separators=(",", ":"))
+
+        cases = {
+            "missing field": missing,
+            "extra field": _valid_fields(owner_id=1),
+            "version 2": _valid_fields(v=2),
+            "version true": _valid_fields(v=True),
+            "version string": _valid_fields(v="1"),
+            "version float": _valid_fields(v=1.0),
+            "uppercase request id": _valid_fields(request_id=REQUEST_ID.upper()),
+            "bad request id": _valid_fields(request_id="123"),
+            "request id not string": _valid_fields(request_id=123),
+            "lowercase fingerprint": _valid_fields(recipient_fp=FINGERPRINT.lower()),
+            "short fingerprint": _valid_fields(recipient_fp=FINGERPRINT[:-5]),
+            "short wrapped key": _valid_fields(
+                wrapped_key=base64.b64encode(WRAPPED_KEY[:-1]).decode("ascii")
+            ),
+            "wrapped key not base64": _valid_fields(wrapped_key="!" * 512),
+            "wrapped key urlsafe": _valid_fields(
+                wrapped_key=base64.urlsafe_b64encode(bytes([251]) * 384).decode("ascii")
+            ),
+            "wrapped key not string": _valid_fields(wrapped_key=384),
+            "duplicate field": valid_json[:-1] + ',"v":1}',
+            "not canonical": json.dumps(_valid_fields()),
+        }
+        for name, fields in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(self.error):
+                    self.share_keys.parse_key_package(_raw_package(fields))
+                    
 
 if __name__ == "__main__":
     unittest.main()

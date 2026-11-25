@@ -1,5 +1,6 @@
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from Crypto.Cipher import PKCS1_OAEP
@@ -10,12 +11,18 @@ from Crypto.PublicKey.RSA import RsaKey
 from Crypto.Random import get_random_bytes
 from werkzeug.security import check_password_hash
 
-from crypto_core import encrypt_blob
+from crypto_core import (
+    encrypt_blob,
+    decrypt_blob,
+    InvalidEnvelopeError,
+)
+
 from db import get_connection
 
 from share_errors import (
     InvalidKeyPackageError,
     KeyUnlockError,
+    KeyLockedError,
 )
 
 RSA_KEY_BITS = 3072
@@ -27,6 +34,9 @@ KEK_SALT_SIZE = 16
 SCRYPT_N = 2**17
 SCRYPT_R = 8
 SCRYPT_P = 1
+
+MAX_FAILED_UNLOCK_ATTEMPTS = 5
+LOCKOUT_DURATION_MINUTES = 15
 
 def _generate_kek_salt() -> bytes:
     """Generate a random salt for KEK derivation."""
@@ -72,6 +82,26 @@ def _private_key_context(user_id: int) -> dict:
         "kind": "private_key",
         "item_id": "private_key",
     }
+
+def _utc_now() -> datetime:
+    """Return the current UTC time."""
+    return datetime.now(timezone.utc)
+
+
+def _parse_locked_until(value: str | None) -> datetime | None:
+    """Parse a stored lockout timestamp as UTC."""
+
+    if value is None:
+        return None
+
+    locked_until = datetime.fromisoformat(value)
+
+    if locked_until.tzinfo is None:
+        locked_until = locked_until.replace(
+            tzinfo=timezone.utc
+        )
+
+    return locked_until.astimezone(timezone.utc)
 
 def _load_public_key(public_key_pem) -> RsaKey:
     """Import and validate a Medimo RSA public key."""
@@ -351,3 +381,307 @@ def generate_user_keypair(user_id, password) -> None:
                 ) from None
 
             raise
+
+
+def _read_unlock_state(connection, user_id):
+    """Read the key material and current unlock security state."""
+
+    return connection.execute(
+        """
+        SELECT
+            public_key_pem,
+            fingerprint,
+            private_key_salt,
+            encrypted_private_key,
+            failed_unlock_count,
+            locked_until
+        FROM user_keys
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+
+def _update_unlock_state(
+    connection,
+    user_id,
+    failed_count,
+    locked_until,
+) -> None:
+    """Persist the failed attempt counter and lockout timestamp."""
+
+    connection.execute(
+        """
+        UPDATE user_keys
+        SET
+            failed_unlock_count = ?,
+            locked_until = ?
+        WHERE user_id = ?
+        """,
+        (
+            failed_count,
+            locked_until,
+            user_id,
+        ),
+    )
+
+def _check_unlock_state(connection, user_id, row, now) -> int:
+    """Reject an active lockout or reset an expired lockout."""
+
+    locked_until = _parse_locked_until(
+        row["locked_until"]
+    )
+
+    if locked_until is not None:
+
+        if now < locked_until:
+            raise KeyLockedError(
+                "Too many unlock attempts."
+            )
+
+        # The previous lockout has expired.
+        _update_unlock_state(
+            connection,
+            user_id,
+            failed_count=0,
+            locked_until=None,
+        )
+
+        return 0
+
+    return row["failed_unlock_count"]
+
+def _recover_private_key(
+    user_id,
+    password,
+    row,
+) -> RsaKey:
+    """Recover and validate an encrypted RSA private key."""
+
+    if not isinstance(password, str) or not password:
+        raise KeyUnlockError(
+            "Private key could not be verified."
+        )
+
+    context = _private_key_context(user_id)
+
+    try:
+        kek = _derive_kek(
+            password,
+            row["private_key_salt"],
+        )
+
+        private_der = decrypt_blob(
+            row["encrypted_private_key"],
+            kek,
+            "AES",
+            context,
+        )
+
+    except (ValueError, InvalidEnvelopeError):
+        raise KeyUnlockError(
+            "Private key could not be verified."
+        ) from None
+
+    finally:
+        # Remove the local KEK reference when available.
+        if "kek" in locals():
+            del kek
+
+    try:
+        private_key = RSA.import_key(private_der)
+
+    except (ValueError, IndexError, TypeError):
+        raise KeyUnlockError(
+            "Private key could not be verified."
+        ) from None
+
+    finally:
+        del private_der
+
+    if not private_key.has_private():
+        raise KeyUnlockError(
+            "Private key could not be verified."
+        )
+
+    if private_key.size_in_bits() != RSA_KEY_BITS:
+        raise KeyUnlockError(
+            "Private key could not be verified."
+        )
+
+    # Ensure the recovered private key matches the stored public key.
+    recovered_public_der = (
+        private_key.public_key()
+        .export_key(format="DER")
+    )
+
+    try:
+        stored_public_key = _load_public_key(
+            row["public_key_pem"]
+        )
+
+    except ValueError:
+        raise KeyUnlockError(
+            "Private key could not be verified."
+        ) from None
+
+    stored_public_der = stored_public_key.export_key(
+        format="DER"
+    )
+
+    if recovered_public_der != stored_public_der:
+        raise KeyUnlockError(
+            "Private key could not be verified."
+        )
+
+    expected_fingerprint = public_key_fingerprint(
+        row["public_key_pem"]
+    )
+
+    if row["fingerprint"] != expected_fingerprint:
+        raise KeyUnlockError(
+            "Private key could not be verified."
+        )
+
+    return private_key
+
+
+def _same_key_material(first_row, second_row) -> bool:
+    """Check whether the stored key material changed during unlock."""
+
+    fields = (
+        "public_key_pem",
+        "fingerprint",
+        "private_key_salt",
+        "encrypted_private_key",
+    )
+
+    return all(
+        first_row[field] == second_row[field]
+        for field in fields
+    )
+
+
+def unlock_private_key(user_id, password) -> RsaKey:
+    """Unlock a user's RSA private key with temporary lockout protection."""
+
+    _private_key_context(user_id)
+
+    # Phase 1: Check the current lockout state and read key material.
+    with closing(get_connection()) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            snapshot = _read_unlock_state(
+                connection,
+                user_id,
+            )
+
+            if snapshot is None:
+                raise KeyUnlockError(
+                    "Private key could not be verified."
+                )
+
+            _check_unlock_state(
+                connection,
+                user_id,
+                snapshot,
+                _utc_now(),
+            )
+
+    # Perform expensive cryptographic operations outside the write lock.
+    private_key = None
+    unlock_failed = False
+
+    try:
+        private_key = _recover_private_key(
+            user_id,
+            password,
+            snapshot,
+        )
+
+    except KeyUnlockError:
+        unlock_failed = True
+
+    # Phase 2: Recheck the latest state and finalize atomically.
+    result_error = None
+
+    with closing(get_connection()) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            current_row = _read_unlock_state(
+                connection,
+                user_id,
+            )
+
+            if current_row is None:
+                raise KeyUnlockError(
+                    "Private key could not be verified."
+                )
+
+            now = _utc_now()
+
+            current_count = _check_unlock_state(
+                connection,
+                user_id,
+                current_row,
+                now,
+            )
+
+            if not _same_key_material(
+                snapshot,
+                current_row,
+            ):
+                result_error = KeyUnlockError(
+                    "Private key could not be verified."
+                )
+
+            elif unlock_failed:
+                next_count = (
+                    current_count + 1
+                )
+
+                if next_count >= MAX_FAILED_UNLOCK_ATTEMPTS:
+                    locked_until = now + timedelta(
+                        minutes=LOCKOUT_DURATION_MINUTES
+                    )
+
+                    _update_unlock_state(
+                        connection,
+                        user_id,
+                        failed_count=MAX_FAILED_UNLOCK_ATTEMPTS,
+                        locked_until=locked_until.isoformat(),
+                    )
+
+                    result_error = KeyLockedError(
+                        "Too many unlock attempts."
+                    )
+
+                else:
+                    _update_unlock_state(
+                        connection,
+                        user_id,
+                        failed_count=next_count,
+                        locked_until=None,
+                    )
+
+                    result_error = KeyUnlockError(
+                        "Private key could not be verified."
+                    )
+
+            else:
+                # Successful unlock resets the security state.
+                _update_unlock_state(
+                    connection,
+                    user_id,
+                    failed_count=0,
+                    locked_until=None,
+                )
+
+    # Raise only after the security state has been committed.
+    if result_error is not None:
+        del private_key
+        raise result_error
+
+    return private_key

@@ -1,0 +1,280 @@
+
+{% extends "app_base.html" %}
+
+{% block title %}My keys — Medimo{% endblock %}
+
+{% block content %}
+
+<header class="top">
+    <div>
+        <span class="eyebrow">DATA SHARING</span>
+        <h1>My keys</h1>
+        <p class="muted">
+            Manage your personal encryption keys.
+        </p>
+    </div>
+</header>
+
+<div class="card panel profile-panel">
+
+    {% if error %}
+    <div class="alert error" role="alert">
+        <p>{{ error }}</p>
+    </div>
+    {% endif %}
+
+    {% for message in get_flashed_messages(
+        category_filter=["keys-success"]
+    ) %}
+    <div class="alert success" role="status">
+        <p>{{ message }}</p>
+    </div>
+    {% endfor %}
+
+    {% if keypair %}
+
+    <div class="profile-intro">
+        <span class="icon" aria-hidden="true">◈</span>
+
+        <div>
+            <h2>Your keypair is ready</h2>
+
+            <p class="muted">
+                RSA-3072 · Private key encrypted
+            </p>
+        </div>
+    </div>
+
+    <h3>Public key fingerprint</h3>
+
+    <p class="muted">
+        This SHA-256 fingerprint identifies your public key.
+        Share it through a trusted channel so the data owner
+        can verify your identity before sending a key package.
+    </p>
+
+    <label for="fingerprint" class="muted">
+        SHA-256 fingerprint
+    </label>
+
+    <textarea
+        id="fingerprint"
+        readonly
+        rows="3"
+        spellcheck="false"
+        aria-label="Public key fingerprint"
+        style="
+            display: block;
+            width: 100%;
+            margin-top: 8px;
+            padding: 14px;
+            border: 1px solid #d8e5ef;
+            border-radius: 10px;
+            background: #fbfdff;
+            color: var(--ink);
+            font-family: monospace;
+            font-size: 14px;
+            line-height: 1.8;
+            resize: vertical;
+        "
+    >{{ keypair.fingerprint }}</textarea>
+
+    <div style="
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-top: 12px;
+    ">
+        <button
+            class="button primary"
+            type="button"
+            id="copy-fingerprint"
+        >
+            Copy fingerprint
+        </button>
+
+        <span
+            id="copy-status"
+            class="muted"
+            role="status"
+            aria-live="polite"
+        ></span>
+    </div>
+
+    <div class="alert success">
+        <p>
+            Your keypair is ready. You can now request
+            access to health records shared by other users.
+        </p>
+    </div>
+
+    <div class="notice">
+        <strong>Keep your password safe.</strong>
+
+        <p style="margin: 6px 0 0;">
+            Your private key is encrypted using a key
+            derived from your Medimo login password.
+            Medimo cannot recover your private key
+            if you forget your password.
+        </p>
+    </div>
+
+    {% else %}
+
+    <div class="profile-intro">
+        <span class="icon" aria-hidden="true">◈</span>
+
+        <div>
+            <h2>No keypair yet</h2>
+
+            <p class="muted">
+                Create your keys to request access
+                to shared health records.
+            </p>
+        </div>
+    </div>
+
+    <h3>Generate your keypair</h3>
+
+    <p class="muted">
+        Enter your current Medimo login password
+        to create your personal RSA keypair.
+    </p>
+
+    <form
+        method="post"
+        action="{{ url_for('keys.generate_keys') }}"
+        class="stack"
+        id="generate-keypair-form"
+        style="max-width: 440px;"
+    >
+        <input
+            type="hidden"
+            name="csrf_token"
+            value="{{ csrf_token }}"
+        >
+
+        <label for="password">
+            Login password
+        </label>
+
+        <input
+            id="password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            placeholder="Enter your login password"
+            required
+        >
+
+        <small>
+            Use the same password you use to log in to Medimo.
+        </small>
+
+        <button
+            class="button primary"
+            type="submit"
+            id="generate-keypair-button"
+        >
+            Generate keypair
+        </button>
+
+        <span
+            id="generation-status"
+            class="muted"
+            role="status"
+            aria-live="polite"
+        ></span>
+
+    </form>
+
+    <div class="notice" style="margin-top: 24px;">
+        <strong>How your keys are protected</strong>
+
+        <p style="margin: 6px 0 0;">
+            Medimo generates a unique RSA-3072 keypair.
+            Your private key is encrypted using a key
+            derived from your login password and is
+            never displayed on this page.
+        </p>
+    </div>
+
+    {% endif %}
+
+</div>
+
+<script>
+(() => {
+    const copyButton = document.getElementById(
+        "copy-fingerprint"
+    );
+
+    const fingerprint = document.getElementById(
+        "fingerprint"
+    );
+
+    const copyStatus = document.getElementById(
+        "copy-status"
+    );
+
+    if (copyButton && fingerprint && copyStatus) {
+        copyButton.addEventListener("click", async () => {
+            try {
+                await navigator.clipboard.writeText(
+                    fingerprint.value
+                );
+
+                copyStatus.textContent =
+                    "Fingerprint copied.";
+
+            } catch (error) {
+                fingerprint.focus();
+                fingerprint.select();
+
+                copyStatus.textContent =
+                    "Press Cmd+C or Ctrl+C to copy.";
+            }
+        });
+    }
+
+    const generateForm = document.getElementById(
+        "generate-keypair-form"
+    );
+
+    const generateButton = document.getElementById(
+        "generate-keypair-button"
+    );
+
+    const generationStatus = document.getElementById(
+        "generation-status"
+    );
+
+    if (
+        generateForm &&
+        generateButton &&
+        generationStatus
+    ) {
+        generateForm.addEventListener("submit", () => {
+            generateButton.disabled = true;
+
+            generateButton.textContent =
+                "Generating keypair...";
+
+            generationStatus.textContent =
+                "Please wait while your keys are generated.";
+        });
+
+        window.addEventListener("pageshow", () => {
+            generateButton.disabled = false;
+
+            generateButton.textContent =
+                "Generate keypair";
+
+            generationStatus.textContent = "";
+        });
+    }
+})();
+</script>
+
+{% endblock %}

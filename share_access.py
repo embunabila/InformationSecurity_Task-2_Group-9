@@ -1,12 +1,15 @@
-
 """Functions for opening and managing shared health records."""
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import db
 
 from crypto_core import decrypt_blob
 from file_payload import unpack_file_payload
-from share_errors import InvalidKeyPackageError
+from share_errors import InvalidKeyPackageError, ShareAccessError
 from share_keys import parse_key_package
-from storage import read_envelope
-
+from storage import delete_envelope, read_envelope
 
 def _validate_key_package(package_text, request_id, recipient_fingerprint):
     """Validate a key package against the request and recipient."""
@@ -67,15 +70,176 @@ def open_shared_item(
     )
 
 
+
 def expire_old_requests():
-    """Expire sharing requests whose expiry time has passed."""
-    raise NotImplementedError(
-        "Waiting for share-request database implementation."
-    )
+    """Expire approved sharing requests whose expiry time has passed."""
+    now = datetime.now(
+        ZoneInfo("Asia/Jakarta")
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+    connection = db.get_connection()
+
+    try:
+        # Lock the database transaction while processing expired requests.
+        connection.execute("BEGIN IMMEDIATE")
+
+        expired_requests = connection.execute(
+            """
+            SELECT id
+            FROM share_requests
+            WHERE status = 'approved'
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+            ORDER BY expires_at, id
+            """,
+            (now,),
+        ).fetchall()
+
+        expired_count = 0
+
+        for request in expired_requests:
+            request_id = request["id"]
+
+            items = connection.execute(
+                """
+                SELECT storage_name
+                FROM shared_items
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchall()
+
+            # Delete encrypted copies from storage.
+            for item in items:
+                delete_envelope(item["storage_name"])
+
+            cursor = connection.execute(
+                """
+                UPDATE share_requests
+                SET status = 'expired',
+                    wrapped_key = NULL
+                WHERE id = ?
+                  AND status = 'approved'
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= ?
+                """,
+                (request_id, now),
+            )
+
+            if cursor.rowcount != 1:
+                continue
+
+            connection.execute(
+                """
+                DELETE FROM shared_items
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO share_audit_log (
+                    request_id,
+                    actor_id,
+                    action
+                )
+                VALUES (?, NULL, 'expired')
+                """,
+                (request_id,),
+            )
+
+            expired_count += 1
+
+        connection.commit()
+        return expired_count
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+
 
 
 def revoke_request(owner_id, request_id):
-    """Revoke an approved sharing request."""
-    raise NotImplementedError(
-        "Waiting for share-request database implementation."
-    )
+    """Revoke an approved sharing request owned by the given user."""
+    connection = db.get_connection()
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        request = connection.execute(
+            """
+            SELECT id, owner_id, status
+            FROM share_requests
+            WHERE id = ? AND owner_id = ?
+            """,
+            (request_id, owner_id),
+        ).fetchone()
+
+        if request is None or request["status"] != "approved":
+            raise ShareAccessError(
+                "Sharing request is not available for revocation."
+            )
+
+        items = connection.execute(
+            """
+            SELECT storage_name
+            FROM shared_items
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchall()
+
+        for item in items:
+            delete_envelope(item["storage_name"])
+
+        cursor = connection.execute(
+            """
+            UPDATE share_requests
+            SET status = 'revoked',
+                wrapped_key = NULL
+            WHERE id = ?
+              AND owner_id = ?
+              AND status = 'approved'
+            """,
+            (request_id, owner_id),
+        )
+
+        if cursor.rowcount != 1:
+            raise ShareAccessError(
+                "Sharing request is not available for revocation."
+            )
+
+        connection.execute(
+            """
+            DELETE FROM shared_items
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO share_audit_log (
+                request_id,
+                actor_id,
+                action
+            )
+            VALUES (?, ?, 'revoked')
+            """,
+            (request_id, owner_id),
+        )
+
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()

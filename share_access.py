@@ -69,9 +69,13 @@ def open_shared_item(
 
 def expire_old_requests():
     """Expire sharing requests whose expiry time has passed."""
-    pass
+    raise NotImplementedError(
+        "Waiting for share-request database implementation."
+    )
 
 
 def revoke_request(owner_id, request_id):
     """Revoke an approved sharing request."""
-    pass
+    raise NotImplementedError(
+        "Waiting for share-request database implementation."
+    )

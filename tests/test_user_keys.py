@@ -1,6 +1,20 @@
 
 import unittest
 
+import hashlib
+
+from Crypto.Cipher import PKCS1_OAEP
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import RSA
+
+from share_errors import InvalidKeyPackageError
+
+from user_keys import (
+    public_key_fingerprint,
+    wrap_key,
+    unwrap_key,
+)
+
 from crypto_core import (
     _encode_context,
     encrypt_blob,
@@ -265,6 +279,392 @@ class TestContextExtension(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             _encode_context(context)
+
+
+class TestRSAPrimitives(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.private_key = RSA.generate(3072)
+
+        cls.public_key_pem = (
+            cls.private_key.public_key()
+            .export_key(format="PEM")
+            .decode("ascii")
+        )
+
+        cls.other_private_key = RSA.generate(3072)
+
+        cls.other_public_key_pem = (
+            cls.other_private_key.public_key()
+            .export_key(format="PEM")
+            .decode("ascii")
+        )
+
+        cls.short_private_key = RSA.generate(2048)
+
+        cls.short_public_key_pem = (
+            cls.short_private_key.public_key()
+            .export_key(format="PEM")
+            .decode("ascii")
+        )
+
+        cls.share_key = bytes(range(32))
+
+        cls.request_id = (
+            "550e8400-e29b-41d4-a716-446655440000"
+        )
+
+        cls.other_request_id = (
+            "550e8400-e29b-41d4-a716-446655440001"
+        )
+
+    def test_fingerprint_format(self):
+        fingerprint = public_key_fingerprint(
+            self.public_key_pem
+        )
+
+        self.assertEqual(len(fingerprint), 79)
+
+        self.assertRegex(
+            fingerprint,
+            r"^[0-9A-F]{4}( [0-9A-F]{4}){15}$",
+        )
+
+    def test_fingerprint_consistency(self):
+        first = public_key_fingerprint(
+            self.public_key_pem
+        )
+
+        second = public_key_fingerprint(
+            self.public_key_pem
+        )
+
+        self.assertEqual(first, second)
+
+    def test_fingerprint_pem_formatting_independence(self):
+        reformatted_pem = self.public_key_pem.replace(
+            "\n", "\r\n"
+        )
+
+        self.assertEqual(
+            public_key_fingerprint(self.public_key_pem),
+            public_key_fingerprint(reformatted_pem),
+        )
+
+    def test_fingerprint_matches_der_sha256(self):
+        public_der = (
+            self.private_key.public_key()
+            .export_key(format="DER")
+        )
+
+        expected = hashlib.sha256(
+            public_der
+        ).hexdigest().upper()
+
+        actual = public_key_fingerprint(
+            self.public_key_pem
+        ).replace(" ", "")
+
+        self.assertEqual(actual, expected)
+
+    def test_different_public_keys_have_different_fingerprints(self):
+        first = public_key_fingerprint(
+            self.public_key_pem
+        )
+
+        second = public_key_fingerprint(
+            self.other_public_key_pem
+        )
+
+        self.assertNotEqual(first, second)
+
+    def test_invalid_public_key(self):
+        with self.assertRaises(ValueError):
+            public_key_fingerprint("invalid-key")
+
+        with self.assertRaises(ValueError):
+            wrap_key(
+                self.share_key,
+                "invalid-key",
+                self.request_id,
+            )
+
+    def test_wrap_unwrap_round_trip(self):
+        wrapped = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        self.assertIsInstance(wrapped, bytes)
+        self.assertEqual(len(wrapped), 384)
+
+        recovered = unwrap_key(
+            wrapped,
+            self.private_key,
+            self.request_id,
+        )
+
+        self.assertEqual(recovered, self.share_key)
+
+    def test_randomized_wrapping(self):
+        first = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        second = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        self.assertNotEqual(first, second)
+
+        for wrapped in (first, second):
+            self.assertEqual(
+                unwrap_key(
+                    wrapped,
+                    self.private_key,
+                    self.request_id,
+                ),
+                self.share_key,
+            )
+
+    def test_wrong_private_key(self):
+        wrapped = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        with self.assertRaises(InvalidKeyPackageError):
+            unwrap_key(
+                wrapped,
+                self.other_private_key,
+                self.request_id,
+            )
+
+    def test_wrong_request_id(self):
+        wrapped = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        with self.assertRaises(InvalidKeyPackageError):
+            unwrap_key(
+                wrapped,
+                self.private_key,
+                self.other_request_id,
+            )
+
+    def test_tampered_ciphertext(self):
+        wrapped = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        tampered = bytearray(wrapped)
+        tampered[len(tampered) // 2] ^= 0x01
+
+        with self.assertRaises(InvalidKeyPackageError):
+            unwrap_key(
+                bytes(tampered),
+                self.private_key,
+                self.request_id,
+            )
+
+    def test_invalid_share_key_length(self):
+        for length in (0, 16, 31, 33, 64):
+            with self.subTest(length=length):
+                with self.assertRaises(ValueError):
+                    wrap_key(
+                        bytes(length),
+                        self.public_key_pem,
+                        self.request_id,
+                    )
+
+    def test_invalid_wrapped_key_length(self):
+        for length in (0, 32, 383, 385):
+            with self.subTest(length=length):
+                with self.assertRaises(InvalidKeyPackageError):
+                    unwrap_key(
+                        bytes(length),
+                        self.private_key,
+                        self.request_id,
+                    )
+
+    def test_invalid_recovered_share_key_length(self):
+        cipher = PKCS1_OAEP.new(
+            self.private_key.public_key(),
+            hashAlgo=SHA256,
+            label=self.request_id.encode("ascii"),
+        )
+
+        wrapped = cipher.encrypt(bytes(16))
+
+        with self.assertRaises(InvalidKeyPackageError):
+            unwrap_key(
+                wrapped,
+                self.private_key,
+                self.request_id,
+            )
+
+    def test_invalid_rsa_public_key_size(self):
+        with self.assertRaises(ValueError):
+            wrap_key(
+                self.share_key,
+                self.short_public_key_pem,
+                self.request_id,
+            )
+
+        with self.assertRaises(ValueError):
+            public_key_fingerprint(
+                self.short_public_key_pem
+            )
+
+    def test_invalid_rsa_private_key_size(self):
+        wrapped = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        with self.assertRaises(InvalidKeyPackageError):
+            unwrap_key(
+                wrapped,
+                self.short_private_key,
+                self.request_id,
+            )
+
+    def test_public_key_used_for_unwrapping(self):
+        wrapped = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        with self.assertRaises(InvalidKeyPackageError):
+            unwrap_key(
+                wrapped,
+                self.private_key.public_key(),
+                self.request_id,
+            )
+
+    def test_invalid_request_id(self):
+        invalid_ids = (
+            "",
+            "invalid",
+            self.request_id.upper(),
+            self.request_id.replace("-", ""),
+            None,
+        )
+
+        wrapped = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        for request_id in invalid_ids:
+            with self.subTest(request_id=request_id):
+                with self.assertRaises(ValueError):
+                    wrap_key(
+                        self.share_key,
+                        self.public_key_pem,
+                        request_id,
+                    )
+
+                with self.assertRaises(InvalidKeyPackageError):
+                    unwrap_key(
+                        wrapped,
+                        self.private_key,
+                        request_id,
+                    )
+
+    def test_private_key_supplied_as_public_input(self):
+        private_pem = self.private_key.export_key(
+            format="PEM"
+        )
+
+        with self.assertRaises(ValueError):
+            public_key_fingerprint(private_pem)
+
+        with self.assertRaises(ValueError):
+            wrap_key(
+                self.share_key,
+                private_pem,
+                self.request_id,
+            )
+
+    def test_invalid_input_types(self):
+        with self.assertRaises(ValueError):
+            wrap_key(
+                "not-bytes",
+                self.public_key_pem,
+                self.request_id,
+            )
+
+        with self.assertRaises(ValueError):
+            public_key_fingerprint(None)
+
+        with self.assertRaises(InvalidKeyPackageError):
+            unwrap_key(
+                "not-bytes",
+                self.private_key,
+                self.request_id,
+            )
+
+        with self.assertRaises(InvalidKeyPackageError):
+            unwrap_key(
+                bytes(384),
+                None,
+                self.request_id,
+            )
+
+    def test_library_interoperability(self):
+        label = self.request_id.encode("ascii")
+
+        wrapped = wrap_key(
+            self.share_key,
+            self.public_key_pem,
+            self.request_id,
+        )
+
+        library_decryptor = PKCS1_OAEP.new(
+            self.private_key,
+            hashAlgo=SHA256,
+            label=label,
+        )
+
+        self.assertEqual(
+            library_decryptor.decrypt(wrapped),
+            self.share_key,
+        )
+
+        library_encryptor = PKCS1_OAEP.new(
+            self.private_key.public_key(),
+            hashAlgo=SHA256,
+            label=label,
+        )
+
+        library_wrapped = library_encryptor.encrypt(
+            self.share_key
+        )
+
+        self.assertEqual(
+            unwrap_key(
+                library_wrapped,
+                self.private_key,
+                self.request_id,
+            ),
+            self.share_key,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

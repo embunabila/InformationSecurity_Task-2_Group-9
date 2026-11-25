@@ -1,0 +1,75 @@
+{% extends "app_base.html" %}
+
+{% block title %}Key package — Medimo{% endblock %}
+
+{% block content %}
+<header class="top">
+    <div>
+        <span class="eyebrow">DATA SHARING</span>
+        <h1>Key package</h1>
+        <p class="muted">Send this package to <strong>{{ requester_username }}</strong> outside Medimo, e.g. via WhatsApp or email.</p>
+    </div>
+    <a class="button secondary" href="/requests">← Requests</a>
+</header>
+
+<div class="card panel profile-panel">
+    <div class="profile-intro">
+        <span class="icon">◈</span>
+        <div>
+            <h2>Shared with {{ requester_username }}</h2>
+            <p class="muted">
+                Category: {{ category }}
+                {% if expires_at %} · Access until {{ expires_at }}{% endif %}
+            </p>
+        </div>
+    </div>
+
+    <h3>1. Check the fingerprint</h3>
+    <p class="muted">
+        Ask {{ requester_username }} to send you the fingerprint shown on their
+        <em>My keys</em> page through a channel you trust. Only send the package
+        if it matches this one exactly.
+    </p>
+    <p class="notice" id="recipient-fingerprint"><code>{{ fingerprint }}</code></p>
+
+    <h3>2. Send the package</h3>
+    <label for="key-package" class="muted">Key package</label>
+    <textarea
+        id="key-package"
+        readonly
+        rows="8"
+        spellcheck="false"
+        style="width:100%;font-family:monospace;font-size:12px;border:1px solid #d8e5ef;border-radius:10px;padding:12px;background:#fbfdff;resize:vertical;word-break:break-all"
+    >{{ package }}</textarea>
+
+    <p style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+        <button class="button primary" type="button" id="copy-package">Copy package</button>
+        <a class="button secondary" href="{{ url_for('grant.download_key_package', request_id=request_id) }}">Download .medimokey</a>
+        <span id="copy-status" class="muted" role="status" aria-live="polite"></span>
+    </p>
+
+    <div class="alert success">
+        <p>
+            Only {{ requester_username }} can open this package, using their own
+            private key and password. If you revoke access, this package stops
+            working.
+        </p>
+    </div>
+</div>
+
+<script>
+(() => {
+    const area = document.getElementById("key-package");
+    const status = document.getElementById("copy-status");
+    document.getElementById("copy-package").addEventListener("click", async () => {
+        try {
+            await navigator.clipboard.writeText(area.value);
+            status.textContent = "Copied.";
+        } catch (error) {
+            area.select();
+            status.textContent = "Press Ctrl+C to copy.";
+        }
+    });
+})();
+</script>
+{% endblock %}

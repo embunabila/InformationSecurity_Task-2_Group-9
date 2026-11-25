@@ -22,6 +22,17 @@ from crypto_core import (
     InvalidEnvelopeError,
 )
 
+from unittest.mock import patch
+
+from user_keys import (
+    _generate_kek_salt,
+    _derive_kek,
+    KEK_SIZE,
+    KEK_SALT_SIZE,
+    SCRYPT_N,
+    SCRYPT_R,
+    SCRYPT_P,
+)
 
 class TestContextExtension(unittest.TestCase):
 
@@ -665,6 +676,121 @@ class TestRSAPrimitives(unittest.TestCase):
             self.share_key,
         )
 
+class TestKEKDerivation(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.password = "MedimoDummyPassword123!"
+        cls.salt = bytes(range(16))
+        cls.kek = _derive_kek(cls.password, cls.salt)
+
+    def test_scrypt_parameters(self):
+        self.assertEqual(SCRYPT_N, 2**17)
+        self.assertEqual(SCRYPT_R, 8)
+        self.assertEqual(SCRYPT_P, 1)
+        self.assertEqual(KEK_SIZE, 32)
+        self.assertEqual(KEK_SALT_SIZE, 16)
+
+    def test_random_salt_format(self):
+        salt = _generate_kek_salt()
+        self.assertIsInstance(salt, bytes)
+        self.assertEqual(len(salt), 16)
+
+    def test_random_salts_are_different(self):
+        salts = {
+            _generate_kek_salt()
+            for _ in range(10)
+        }
+        self.assertEqual(len(salts), 10)
+
+    def test_kek_output_format(self):
+        self.assertIsInstance(self.kek, bytes)
+        self.assertEqual(len(self.kek), 32)
+
+    def test_deterministic_kek_derivation(self):
+        result = _derive_kek(self.password, self.salt)
+        self.assertEqual(result, self.kek)
+
+    def test_different_password_produces_different_kek(self):
+        result = _derive_kek(
+            "DifferentDummyPassword123!",
+            self.salt,
+        )
+        self.assertNotEqual(result, self.kek)
+
+    def test_different_salt_produces_different_kek(self):
+        result = _derive_kek(
+            self.password,
+            bytes(range(1, 17)),
+        )
+        self.assertNotEqual(result, self.kek)
+
+    def test_scrypt_library_interoperability(self):
+        expected = hashlib.scrypt(
+            self.password.encode("utf-8"),
+            salt=self.salt,
+            n=2**17,
+            r=8,
+            p=1,
+            dklen=32,
+            maxmem=256 * 1024 * 1024,
+        )
+        self.assertEqual(self.kek, expected)
+
+    def test_invalid_password_type(self):
+        with patch("user_keys.scrypt") as mocked_scrypt:
+            for password in (None, 123, b"password"):
+                with self.subTest(password=password):
+                    with self.assertRaises(ValueError):
+                        _derive_kek(password, self.salt)
+
+            mocked_scrypt.assert_not_called()
+
+    def test_empty_password(self):
+        with patch("user_keys.scrypt") as mocked_scrypt:
+            with self.assertRaises(ValueError):
+                _derive_kek("", self.salt)
+
+            mocked_scrypt.assert_not_called()
+
+    def test_invalid_salt(self):
+        invalid_salts = (
+            None,
+            "invalid",
+            bytearray(16),
+            b"",
+            bytes(15),
+            bytes(17),
+        )
+
+        with patch("user_keys.scrypt") as mocked_scrypt:
+            for salt in invalid_salts:
+                with self.subTest(salt=salt):
+                    with self.assertRaises(ValueError):
+                        _derive_kek(self.password, salt)
+
+            mocked_scrypt.assert_not_called()
+
+    def test_utf8_and_scrypt_arguments(self):
+        password = "Medimo密码123!"
+
+        with patch(
+            "user_keys.scrypt",
+            return_value=bytes(32),
+        ) as mocked_scrypt:
+
+            result = _derive_kek(password, self.salt)
+
+            mocked_scrypt.assert_called_once_with(
+                password.encode("utf-8"),
+                self.salt,
+                key_len=32,
+                N=2**17,
+                r=8,
+                p=1,
+            )
+
+            self.assertEqual(result, bytes(32))
 
 if __name__ == "__main__":
     unittest.main()

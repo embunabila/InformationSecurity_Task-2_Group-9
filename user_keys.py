@@ -8,11 +8,47 @@ from Crypto.PublicKey.RSA import RsaKey
 
 from share_errors import InvalidKeyPackageError
 
+from Crypto.Protocol.KDF import scrypt
+from Crypto.Random import get_random_bytes
 
 RSA_KEY_BITS = 3072
 SHARE_KEY_SIZE = 32
 WRAPPED_KEY_SIZE = RSA_KEY_BITS // 8
 
+KEK_SIZE = 32
+KEK_SALT_SIZE = 16
+SCRYPT_N = 2**17
+SCRYPT_R = 8
+SCRYPT_P = 1
+
+def _generate_kek_salt() -> bytes:
+    """Generate a random salt for KEK derivation."""
+    return get_random_bytes(KEK_SALT_SIZE)
+
+
+def _derive_kek(password: str, salt: bytes) -> bytes:
+    """Derive a 32-byte KEK from a login password using scrypt."""
+
+    if not isinstance(password, str):
+        raise ValueError("Password must be a string.")
+
+    if not password:
+        raise ValueError("Password must not be empty.")
+
+    if not isinstance(salt, bytes):
+        raise ValueError("KEK salt must be bytes.")
+
+    if len(salt) != KEK_SALT_SIZE:
+        raise ValueError("KEK salt must be 16 bytes.")
+
+    return scrypt(
+        password.encode("utf-8"),
+        salt,
+        key_len=KEK_SIZE,
+        N=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+    )
 
 def _load_public_key(public_key_pem) -> RsaKey:
     """Import and validate a Medimo RSA public key."""

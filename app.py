@@ -21,7 +21,6 @@ from flask import (
     url_for,
 )
 
-from flask import Flask, redirect, render_template, request, send_file, session, url_for
 from werkzeug.security import (
     check_password_hash,
     generate_password_hash,
@@ -76,6 +75,9 @@ def home():
 
 
 USERNAME_PATTERN = re.compile(r"[a-z0-9_]{3,30}")
+
+# scrypt N=2^17, r=8, p=1: OWASP Password Storage minimum (default Werkzeug only N=2^15)
+PASSWORD_HASH_METHOD = "scrypt:131072:8:1"
 
 PROFILE_FIELDS = (
     "name",
@@ -228,7 +230,10 @@ def register():
         elif password != confirm_password:
             error = "Konfirmasi password tidak cocok."
         else:
-            password_hash = generate_password_hash(password)
+            password_hash = generate_password_hash(
+                password,
+                method=PASSWORD_HASH_METHOD,
+            )
 
             try:
                 create_user(username, password_hash)
@@ -558,7 +563,6 @@ def upload_archive():
         # Coba hapus setiap salinan yang sudah ditulis.
         for storage_name in storage_names.values():
             try:
-                from storage import delete_envelope
                 delete_envelope(storage_name)
             except (OSError, ValueError):
                 app.logger.error(

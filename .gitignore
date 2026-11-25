@@ -1,29 +1,33 @@
-PS C:\Users\nayla\Downloads\InformationSecurity_Task-1_Group-9> Get-Content .gitignore
-
+# Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+
+# Virtual environment
 .venv/
-<<<<<<< Updated upstream
+
+# Secrets: SECRET_KEY & MASTER_KEY live in .env.local
 .env
 .env.*
 !.env.example
+
+# Database (medimo.db plus SQLite journal/WAL files)
 *.db
 *.db-*
 *.sqlite
 *.sqlite3
 instance/
+
+# Encrypted envelopes & tool output
 storage/
 ciphertexts/
 results/
-.pytest_cache/
-.DS_Store
-
 !benchmark/results/
 !benchmark/results/**
-=======
-medimo.db
-.env
-instance/
-storage/
->>>>>>> Stashed changes
-(.venv) PS C:\Users\nayla\Downloads\InformationSecurity_Task-1_Group-9> 
+
+# Key packages for sharing (Assignment 2)
+*.medimokey
+
+# OS
+.DS_Store
+Thumbs.db

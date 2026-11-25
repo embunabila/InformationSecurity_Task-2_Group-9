@@ -48,6 +48,10 @@ from db import (
 )
 
 from file_payload import pack_file_payload, unpack_file_payload
+from access_routes import access_bp
+from grant_routes import grant_bp
+from keys_routes import keys_bp
+from request_routes import requests_bp
 from storage import (
     delete_envelope,
     delete_envelope_set,
@@ -62,12 +66,18 @@ if not secret_key:
 
 app.config["SECRET_KEY"] = secret_key
 MASTER_KEY = load_master_key()
+app.config["MASTER_KEY"] = MASTER_KEY
 
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 MAX_UPLOAD_FILE_SIZE = 25 * 1024 * 1024 
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_FILE_SIZE + 128 * 1024 
+
+app.register_blueprint(keys_bp)
+app.register_blueprint(requests_bp)
+app.register_blueprint(grant_bp)
+app.register_blueprint(access_bp)
 
 @app.route("/")
 def home():

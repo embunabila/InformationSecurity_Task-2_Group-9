@@ -2,6 +2,7 @@
 import sqlite3
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,9 @@ from share_requests import (
     get_request_for_owner,
     get_active_request_for_requester,
     record_share_event,
+    create_request,
+    approve_request,
+    reject_request,
 )
 
 
@@ -47,6 +51,10 @@ class ShareRequestsTests(unittest.TestCase):
         self.db_path_patcher.stop()
         self.temp_dir.cleanup()
 
+    # ============================================================
+    # HELPER FUNCTIONS
+    # ============================================================
+
     def create_request(self):
         return create_share_request(
             self.requester_id,
@@ -54,6 +62,23 @@ class ShareRequestsTests(unittest.TestCase):
             "document",
             "Need it for a check-up",
         )
+
+    def create_new_request(self, category="document"):
+        """Create a request using the new username-based API."""
+        with patch(
+            "share_requests.get_public_key",
+            return_value={"public_key_pem": "test-public-key"},
+        ):
+            return create_request(
+                self.requester_id,
+                "owner",
+                category,
+                "Need access for testing",
+            )
+
+    # ============================================================
+    # LEGACY CREATE REQUEST TESTS
+    # ============================================================
 
     def test_create_share_request(self):
         request_id = self.create_request()
@@ -112,6 +137,10 @@ class ShareRequestsTests(unittest.TestCase):
 
         with self.assertRaises(sqlite3.IntegrityError):
             self.create_request()
+
+    # ============================================================
+    # LEGACY APPROVE REQUEST TESTS
+    # ============================================================
 
     def test_approve_share_request(self):
         request_id = self.create_request()
@@ -178,6 +207,10 @@ class ShareRequestsTests(unittest.TestCase):
                 "2099-12-31 23:59:59",
             )
 
+    # ============================================================
+    # LEGACY REJECT REQUEST TESTS
+    # ============================================================
+
     def test_reject_share_request(self):
         request_id = self.create_request()
 
@@ -196,6 +229,10 @@ class ShareRequestsTests(unittest.TestCase):
 
         with self.assertRaises(ShareAccessError):
             reject_share_request(self.requester_id, request_id)
+
+    # ============================================================
+    # REQUEST ACCESS TESTS
+    # ============================================================
 
     def test_get_request_for_owner_rejects_other_owner(self):
         request_id = self.create_request()
@@ -273,6 +310,10 @@ class ShareRequestsTests(unittest.TestCase):
                 request_id,
             )
 
+    # ============================================================
+    # AUDIT LOG TESTS
+    # ============================================================
+
     def test_record_share_event(self):
         request_id = self.create_request()
 
@@ -301,6 +342,250 @@ class ShareRequestsTests(unittest.TestCase):
     def test_record_share_event_rejects_empty_action(self):
         with self.assertRaises(ValueError):
             record_share_event(None, self.owner_id, "   ")
+
+    # ============================================================
+    # NEW CREATE REQUEST TESTS
+    # ============================================================
+
+    def test_new_create_request_success(self):
+        request_id = self.create_new_request()
+
+        self.assertIsInstance(request_id, str)
+        self.assertEqual(len(request_id), 36)
+
+        request = get_request_for_owner(self.owner_id, request_id)
+
+        self.assertEqual(request["requester_id"], self.requester_id)
+        self.assertEqual(request["owner_id"], self.owner_id)
+        self.assertEqual(request["category"], "document")
+        self.assertEqual(request["status"], "pending")
+
+        connection = db.get_connection()
+        event = connection.execute(
+            """
+            SELECT action FROM share_audit_log
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        connection.close()
+
+        self.assertEqual(event["action"], "requested")
+
+    def test_new_create_request_rejects_duplicate_pending(self):
+        self.create_new_request()
+
+        with self.assertRaises(ValueError):
+            self.create_new_request()
+
+    # ============================================================
+    # NEW APPROVE REQUEST TESTS
+    # ============================================================
+
+    def test_new_approve_request_success(self):
+        request_id = self.create_new_request()
+
+        item_id = str(uuid.uuid4())
+        storage_name = "test-shared-envelope"
+
+        share_result = {
+            "wrapped_key": b"wrapped-test-key",
+            "shared_items": [
+                {
+                    "id": item_id,
+                    "source_file_id": None,
+                    "storage_name": storage_name,
+                }
+            ],
+        }
+
+        with (
+            patch(
+                "share_requests.get_public_key",
+                return_value={
+                    "public_key_pem": "test-public-key"
+                },
+            ),
+            patch(
+                "share_requests.create_share",
+                return_value=share_result,
+            ),
+        ):
+            approve_request(
+                owner_id=self.owner_id,
+                request_id=request_id,
+                selection={
+                    "file_ids": [str(uuid.uuid4())]
+                },
+                days=7,
+                master_key=b"test-master-key",
+            )
+
+        request = get_request_for_owner(self.owner_id, request_id)
+
+        self.assertEqual(request["status"], "approved")
+        self.assertEqual(
+            bytes(request["wrapped_key"]),
+            b"wrapped-test-key",
+        )
+        self.assertIsNotNone(request["expires_at"])
+        self.assertIsNotNone(request["decided_at"])
+
+        connection = db.get_connection()
+
+        items = connection.execute(
+            """
+            SELECT * FROM shared_items
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchall()
+
+        event = connection.execute(
+            """
+            SELECT action FROM share_audit_log
+            WHERE request_id = ? AND action = 'approved'
+            """,
+            (request_id,),
+        ).fetchone()
+
+        connection.close()
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], item_id)
+        self.assertEqual(items[0]["storage_name"], storage_name)
+        self.assertEqual(event["action"], "approved")
+
+    def test_new_approve_request_rejects_invalid_days(self):
+        request_id = self.create_new_request()
+
+        for days in (0, 2, 14, 31, -1):
+            with self.subTest(days=days):
+                with self.assertRaises(ValueError):
+                    approve_request(
+                        owner_id=self.owner_id,
+                        request_id=request_id,
+                        selection={
+                            "file_ids": [str(uuid.uuid4())]
+                        },
+                        days=days,
+                        master_key=b"test-master-key",
+                    )
+
+    def test_new_approve_request_rejects_non_pending_request(self):
+        request_id = self.create_new_request()
+
+        reject_request(self.owner_id, request_id)
+
+        with self.assertRaises(ShareAccessError):
+            approve_request(
+                owner_id=self.owner_id,
+                request_id=request_id,
+                selection={
+                    "file_ids": [str(uuid.uuid4())]
+                },
+                days=7,
+                master_key=b"test-master-key",
+            )
+
+    def test_new_approve_request_cleans_up_when_database_fails(self):
+        request_id = self.create_new_request()
+
+        item_id = str(uuid.uuid4())
+        storage_name = "test-envelope-cleanup"
+
+        share_result = {
+            "wrapped_key": b"wrapped-test-key",
+            "shared_items": [
+                {
+                    "id": item_id,
+                    "source_file_id": None,
+                    "storage_name": storage_name,
+                }
+            ],
+        }
+
+        connection = db.get_connection()
+        connection.execute(
+            """
+            CREATE TRIGGER fail_shared_item_insert
+            BEFORE INSERT ON shared_items
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated database failure');
+            END;
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        with (
+            patch(
+                "share_requests.get_public_key",
+                return_value={
+                    "public_key_pem": "test-public-key"
+                },
+            ),
+            patch(
+                "share_requests.create_share",
+                return_value=share_result,
+            ),
+            patch("share_requests.delete_envelope") as cleanup,
+        ):
+            with self.assertRaises(sqlite3.IntegrityError):
+                approve_request(
+                    owner_id=self.owner_id,
+                    request_id=request_id,
+                    selection={
+                        "file_ids": [str(uuid.uuid4())]
+                    },
+                    days=7,
+                    master_key=b"test-master-key",
+                )
+
+        cleanup.assert_called_once_with(storage_name)
+
+        request = get_request_for_owner(self.owner_id, request_id)
+        self.assertEqual(request["status"], "pending")
+
+        connection = db.get_connection()
+        items = connection.execute(
+            """
+            SELECT * FROM shared_items
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchall()
+        connection.close()
+
+        self.assertEqual(len(items), 0)
+
+    # ============================================================
+    # NEW REJECT REQUEST TESTS
+    # ============================================================
+
+    def test_new_reject_request_success(self):
+        request_id = self.create_new_request()
+
+        result = reject_request(self.owner_id, request_id)
+
+        self.assertTrue(result)
+
+        request = get_request_for_owner(self.owner_id, request_id)
+
+        self.assertEqual(request["status"], "rejected")
+        self.assertIsNotNone(request["decided_at"])
+
+        connection = db.get_connection()
+        event = connection.execute(
+            """
+            SELECT action FROM share_audit_log
+            WHERE request_id = ? AND action = 'rejected'
+            """,
+            (request_id,),
+        ).fetchone()
+        connection.close()
+
+        self.assertEqual(event["action"], "rejected")
 
 
 if __name__ == "__main__":

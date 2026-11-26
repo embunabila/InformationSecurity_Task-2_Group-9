@@ -1,4 +1,3 @@
-
 """Routes for managing health record sharing requests."""
 
 import secrets
@@ -7,6 +6,8 @@ import sqlite3
 from flask import (
     Blueprint,
     current_app,
+    flash,
+    get_flashed_messages,
     make_response,
     redirect,
     render_template,
@@ -14,6 +15,8 @@ from flask import (
     session,
     url_for,
 )
+
+from crypto_core import InvalidEnvelopeError
 
 from db import (
     get_medical_files_for_owner,
@@ -37,6 +40,25 @@ requests_bp = Blueprint("requests", __name__)
 SERVER_ERROR_MESSAGE = (
     "Your requests could not be accessed. Please try again later."
 )
+
+ACCESS_ERROR_MESSAGE = "Akses tidak tersedia atau sudah berakhir."
+SEND_ERROR_MESSAGE = (
+    "The request could not be sent. Check the username and try again."
+)
+APPROVE_ERROR_MESSAGE = (
+    "The request could not be approved. Check your selection and try again."
+)
+
+SAFE_SEND_ERRORS = {
+    "Owner username cannot be empty.",
+    "Invalid sharing category.",
+    "Reason cannot be empty.",
+    "Reason cannot exceed 500 characters.",
+    "You need to generate a keypair before requesting data.",
+}
+
+SUCCESS = "requests-success"
+ERROR = "requests-error"
 
 PROFILE_FIELDS = (
     ("name", "Name"),
@@ -104,19 +126,25 @@ def _load_page_data(user_id):
     }
 
 
-def _render_requests(user_id, notice=None, error=None, status=200):
-    """Render the requests page."""
+def _render_requests(user_id):
+    """Render the requests page with any message from the last action."""
     page_data = _load_page_data(user_id)
 
-    return (
-        render_template(
-            "requests.html",
-            **page_data,
-            notice=notice,
-            error=error,
-        ),
-        status,
+    notices = get_flashed_messages(category_filter=[SUCCESS])
+    errors = get_flashed_messages(category_filter=[ERROR])
+
+    return render_template(
+        "requests.html",
+        **page_data,
+        notice=notices[-1] if notices else None,
+        error=errors[-1] if errors else None,
     )
+
+
+def _back_to_requests(message, category):
+    """Store a message and redirect, so a page refresh does not resend the form."""
+    flash(message, category)
+    return redirect(url_for("requests.my_requests"))
 
 
 def _authenticated_user():
@@ -172,17 +200,11 @@ def send_request():
             reason=reason,
         )
 
-        return _render_requests(
-            user_id,
-            notice="Your sharing request has been sent.",
-        )
+        return _back_to_requests("Your sharing request has been sent.", SUCCESS)
 
     except ValueError as exc:
-        return _render_requests(
-            user_id,
-            error=str(exc),
-            status=400,
-        )
+        message = str(exc) if str(exc) in SAFE_SEND_ERRORS else SEND_ERROR_MESSAGE
+        return _back_to_requests(message, ERROR)
 
     except sqlite3.Error:
         return _server_error()
@@ -232,29 +254,19 @@ def approve_sharing_request(request_id):
             master_key=current_app.config["MASTER_KEY"],
         )
 
-        return _render_requests(
-            user_id,
-            notice="The sharing request has been approved.",
-        )
+        return _back_to_requests("The sharing request has been approved.", SUCCESS)
 
-    except ValueError as exc:
-        return _render_requests(
-            user_id,
-            error=str(exc),
-            status=400,
-        )
+    except ValueError:
+        return _back_to_requests(APPROVE_ERROR_MESSAGE, ERROR)
 
-    except ShareAccessError as exc:
-        return _render_requests(
-            user_id,
-            error=str(exc),
-            status=403,
-        )
+    except ShareAccessError:
+        return _back_to_requests(ACCESS_ERROR_MESSAGE, ERROR)
 
-    except sqlite3.Error:
-        return _server_error()
+    except InvalidEnvelopeError:
+        # The owner's original file failed its integrity check.
+        return _back_to_requests(APPROVE_ERROR_MESSAGE, ERROR)
 
-    except OSError:
+    except (sqlite3.Error, OSError):
         return _server_error()
 
 
@@ -277,17 +289,10 @@ def reject_sharing_request(request_id):
             request_id=request_id,
         )
 
-        return _render_requests(
-            user_id,
-            notice="The sharing request has been rejected.",
-        )
+        return _back_to_requests("The sharing request has been rejected.", SUCCESS)
 
-    except ShareAccessError as exc:
-        return _render_requests(
-            user_id,
-            error=str(exc),
-            status=403,
-        )
+    except ShareAccessError:
+        return _back_to_requests(ACCESS_ERROR_MESSAGE, ERROR)
 
     except sqlite3.Error:
         return _server_error()
